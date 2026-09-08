@@ -9,6 +9,7 @@
 import { createApp, themes, type Container, type KeyEvent, type Theme } from "@profullstack/hqtui";
 import { loadCollection, resolveRequest, type RequestFile } from "./collection.ts";
 import { formatBody, send, statusKind, type Exchange } from "./send.ts";
+import { highlightBody, type JsonPalette } from "./highlight.ts";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -111,6 +112,20 @@ async function main(): Promise<void> {
   await app.start();
 }
 
+
+/** JSON token colours, drawn from the active theme rather than hard-coded. */
+export function jsonPalette(theme: Theme): JsonPalette {
+  return {
+    key: theme.accent,
+    string: theme.success,
+    number: theme.warning,
+    boolean: theme.secondary,
+    null: theme.muted,
+    punctuation: theme.muted,
+    plain: theme.foreground,
+  };
+}
+
 export function view(
   { ui, theme, height }: { ui: Container; theme: Theme; height: number },
   state: State,
@@ -202,10 +217,16 @@ export function view(
             exchange.headers.slice(0, 4).map(([k, v]) => ({ label: `${k}:`, value: v, color: theme.muted })),
           );
           p.divider({ label: "body" });
-          // Monochrome for now. The JSON highlighter wants styled spans, which
-          // land in @profullstack/hqtui 0.3.0 — see profullstack/hqtui#60.
-          const body = formatBody(exchange.body, exchange.contentType).split("\n");
-          p.text(body.slice(state.bodyOffset).join("\n"), { fg: theme.foreground });
+          const body = highlightBody(
+            formatBody(exchange.body, exchange.contentType),
+            exchange.contentType,
+            jsonPalette(theme),
+          );
+          // One text() call per line rather than one for the whole body: the
+          // pane scrolls by line, so slicing here is what makes bodyOffset work.
+          for (const line of body.slice(state.bodyOffset, state.bodyOffset + 400)) {
+            p.text(line.length === 0 ? " " : line, { size: 1 });
+          }
         });
       });
     });
