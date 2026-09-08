@@ -1,0 +1,6 @@
+# {{TOKEN}} is filled from .env or the environment, so secrets stay uncommitted.
+POST https://httpbin.org/post
+Content-Type: application/json
+Authorization: Bearer {{TOKEN}}
+
+{"name": "r3q", "ok": true}

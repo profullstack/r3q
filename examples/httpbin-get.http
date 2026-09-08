@@ -1,0 +1,3 @@
+# A plain GET. Comments before the request line are ignored.
+GET https://httpbin.org/get?hello=world
+Accept: application/json
