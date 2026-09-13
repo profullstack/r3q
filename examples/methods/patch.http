@@ -1,0 +1,8 @@
+# Update item
+PATCH https://httpbin.org/anything/items/1
+Accept: application/json
+Content-Type: application/json
+
+{
+  "completed": true
+}

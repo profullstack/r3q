@@ -66,7 +66,7 @@ test("resolveRequest substitutes into url, headers and body", () => {
 test("loads the example collection, bad file included", () => {
   const found = loadCollection(EXAMPLES);
   const ids = found.map((r) => r.id).sort();
-  assert.deepEqual(ids, ["broken.http", "httpbin-get.http", "httpbin-post.http"]);
+  assert.deepEqual(ids, ["broken.http", "httpbin-get.http", "httpbin-post.http", ...["delete", "get", "head", "options", "patch", "post", "put", "trace"].map((method) => `methods/${method}.http`)]);
   assert.equal(found.find((r) => r.id === "broken.http")?.error !== undefined, true);
   assert.equal(found.find((r) => r.id === "httpbin-get.http")?.method, "GET");
 });

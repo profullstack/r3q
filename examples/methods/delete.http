@@ -1,0 +1,5 @@
+# Delete item
+DELETE https://httpbin.org/anything/items/1
+Accept: application/json
+
+

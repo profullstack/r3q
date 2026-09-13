@@ -1,0 +1,5 @@
+# Inspect headers
+HEAD https://httpbin.org/anything/items
+Accept: application/json
+
+

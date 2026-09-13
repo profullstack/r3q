@@ -10,6 +10,7 @@ import { createApp, themes, type Container, type KeyEvent, type Theme } from "@p
 import { scanCollection, scanCollectionAsync, resolveRequest, type RequestFile, type Scan } from "./collection.ts";
 import { formatBody, send, statusKind, type Exchange } from "./send.ts";
 import { highlightBody, type JsonPalette } from "./highlight.ts";
+import { RequestManager } from "./request-manager.ts";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -73,7 +74,11 @@ const methodColor = (theme: Record<string, number>, method: string): number => (
 }[method] ?? theme.secondary) as number;
 
 export const USAGE = `Usage:
-  r3q [dir]   browse the .http files in dir (default: the working directory); Enter sends`;
+  r3q [dir]   browse the .http files in dir (default: the working directory)
+
+  n new request  v view file  e edit  d duplicate  x delete  r reload
+  Enter sends the selected request, or starts the wizard in an empty collection
+  Saved requests are .http files. Deleted files move to .r3q-trash.`;
 
 export async function main(): Promise<void> {
   if (process.argv.slice(2).some((a) => a === "-h" || a === "--help")) {
@@ -83,10 +88,11 @@ export async function main(): Promise<void> {
   const root = resolve(process.argv[2] ?? ".");
   const state = createState(root, { requests: [], dirs: 0, truncated: false });
 
-  const app = await createApp({ theme: themes.dark, title: "r3q", quitKeys: ["ctrl+c"] });
+  // The form owns cursor movement and Tab order, including multiline fields.
+  const app = await createApp({ theme: themes.dark, title: "r3q", quitKeys: ["ctrl+c"], focusNavigation: false });
 
   let scanController: AbortController | undefined;
-  const reload = async (): Promise<void> => {
+  const reload = async (selectId = state.requests[state.selected]?.id, note = ""): Promise<void> => {
     scanController?.abort();
     const controller = new AbortController();
     scanController = controller;
@@ -94,7 +100,7 @@ export async function main(): Promise<void> {
     state.selected = 0;
     state.offset = 0;
     state.loading = true;
-    state.note = "";
+    state.note = note;
     state.vars = loadVars(root);
     app.invalidate();
     try {
@@ -102,10 +108,11 @@ export async function main(): Promise<void> {
         signal: controller.signal,
         onRequest: (request) => {
           state.requests.push(request);
+          if (request.id === selectId) state.selected = state.requests.length - 1;
           app.invalidate();
         },
       });
-      if (!controller.signal.aborted) state.note = scanNote(scan);
+      if (!controller.signal.aborted) state.note = [note, scanNote(scan)].filter(Boolean).join(" · ");
     } catch (error) {
       if (!controller.signal.aborted) state.note = String(error);
     } finally {
@@ -117,6 +124,17 @@ export async function main(): Promise<void> {
   };
 
   const current = (): RequestFile | undefined => state.requests[state.selected];
+  const manager = new RequestManager(root, {
+    current,
+    invalidate: () => app.invalidate(),
+    changed: async (id, note) => {
+      state.exchange = undefined;
+      state.bodyOffset = 0;
+      state.pane = "collection";
+      await reload(id, note);
+    },
+    note: (note) => { state.note = note; app.invalidate(); },
+  });
 
   const fire = async (): Promise<void> => {
     const request = current();
@@ -133,11 +151,17 @@ export async function main(): Promise<void> {
   };
 
   app.on("key", (event: KeyEvent) => {
+    if (manager.dialog) { manager.key(event); return; }
     switch (event.key) {
       case "q": app.quit(); return;
       case "tab": state.pane = state.pane === "collection" ? "response" : "collection"; return;
       case "r": void reload(); return;
-      case "enter": void fire(); return;
+      case "n": manager.create(); return;
+      case "v": void manager.open("view"); return;
+      case "e": void manager.open("edit"); return;
+      case "d": void manager.open("duplicate"); return;
+      case "x": case "delete": void manager.open("delete"); return;
+      case "enter": if (state.requests.length === 0) manager.create(); else void fire(); return;
       case "up":
         if (state.pane === "collection") state.selected = Math.max(0, state.selected - 1);
         else state.bodyOffset = Math.max(0, state.bodyOffset - 1);
@@ -152,8 +176,17 @@ export async function main(): Promise<void> {
       case "home": state.bodyOffset = 0; return;
     }
   });
+  app.on("paste", (event) => manager.paste(event.text));
 
-  app.render((args) => view(args, state));
+  app.render((args) => {
+    view(args, state, {
+      create: () => manager.create(),
+      open: (kind) => void manager.open(kind),
+      reload: () => void reload(),
+      send: () => { if (state.requests.length === 0) manager.create(); else void fire(); },
+    });
+    manager.render(args.ui, args.theme, args.width, args.height);
+  });
   void reload();
   try {
     await app.start();
@@ -179,13 +212,14 @@ export function jsonPalette(theme: Theme): JsonPalette {
 export function view(
   { ui, theme, height }: { ui: Container; theme: Theme; height: number },
   state: State,
+  actions?: { create: () => void; open: (kind: "view" | "edit" | "duplicate" | "delete") => void; reload: () => void; send: () => void },
 ): void {
   {
     ui.row({ size: 1 }, (header) => {
       header.text(" r3q", { fg: theme.title, bold: true, size: 6 });
       header.text(state.root, { fg: theme.muted });
       header.text(
-        `${state.loading ? "Loading… " : ""}${state.requests.length} requests  Tab panes  Enter send  r reload  q quit `,
+        `${state.loading ? "Loading… " : ""}${state.requests.length} requests  n new  Enter send  q quit `,
         { fg: theme.muted, align: "right" },
       );
     });
@@ -202,7 +236,10 @@ export function view(
             return;
           }
           p.label(`No .http files under ${state.root}`);
-          p.label("Create one and press r to reload.");
+          p.spacer(1);
+          p.button({ label: "New request (n)", onPress: actions?.create });
+          p.label("Press n or Enter for the wizard.");
+          p.label("Prefilled methods, headers and bodies.");
           return;
         }
         p.table({
@@ -227,7 +264,13 @@ export function view(
       row.column({ width: "2fr", gap: 1 }, (right) => {
         const request = state.requests[state.selected];
         right.panel({ title: "Request", size: 9 }, (p) => {
-          if (!request) { p.label("Nothing selected."); return; }
+          if (!request) {
+            p.label("Create your first request with n.");
+            p.label("Choose GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS or TRACE.");
+            p.label("The wizard saves a .http file in this collection.");
+            p.label("Press Enter on a saved request when you want to send it.");
+            return;
+          }
           if (request.error) {
             p.text(`${request.id}: ${request.error}`, { fg: theme.danger, wrap: true });
             return;
@@ -287,10 +330,14 @@ export function view(
 
     ui.statusBar({
       items: [
-        { key: "Enter", label: "Send" },
+        { key: "n", label: "New", onPress: actions?.create },
+        { key: "v", label: "View", onPress: () => actions?.open("view") },
+        { key: "e", label: "Edit", onPress: () => actions?.open("edit") },
+        { key: "d", label: "Duplicate", onPress: () => actions?.open("duplicate") },
+        { key: "x", label: "Delete", onPress: () => actions?.open("delete") },
+        { key: "Enter", label: state.requests.length ? "Send" : "New", onPress: actions?.send },
         { key: "Tab", label: state.pane === "collection" ? "Collection" : "Response", active: true },
-        { key: "↑↓", label: "Move" },
-        { key: "r", label: "Reload" },
+        { key: "r", label: "Reload", onPress: actions?.reload },
         { key: "q", label: "Quit" },
       ],
     });

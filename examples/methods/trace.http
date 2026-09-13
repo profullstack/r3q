@@ -1,0 +1,5 @@
+# Trace request
+TRACE https://httpbin.org/anything/items
+Accept: application/json
+
+

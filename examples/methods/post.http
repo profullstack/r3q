@@ -1,0 +1,9 @@
+# Create item
+POST https://httpbin.org/anything/items
+Accept: application/json
+Content-Type: application/json
+
+{
+  "name": "Example item",
+  "completed": false
+}

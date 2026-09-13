@@ -1,0 +1,9 @@
+# Replace item
+PUT https://httpbin.org/anything/items/1
+Accept: application/json
+Content-Type: application/json
+
+{
+  "name": "Replacement item",
+  "completed": true
+}

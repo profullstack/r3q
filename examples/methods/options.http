@@ -1,0 +1,5 @@
+# Inspect options
+OPTIONS https://httpbin.org/anything/items
+Accept: application/json
+
+

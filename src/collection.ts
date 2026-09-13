@@ -19,7 +19,7 @@ export interface RequestFile {
   error?: string;
 }
 
-const METHODS = new Set([
+export const METHODS = new Set([
   "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
 ]);
 

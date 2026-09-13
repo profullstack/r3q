@@ -25,6 +25,9 @@ export async function send(request: RequestFile, timeoutMs = 30_000): Promise<Ex
     status: 0, statusText: "", headers: [], body: "",
     ms: performance.now() - started, bytes: 0, contentType: "", error,
   });
+  if (request.method === "TRACE" || request.method === "CONNECT") {
+    return empty(`${request.method} can be inspected as a template, but the fetch runtime does not support sending it.`);
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
