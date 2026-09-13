@@ -4,7 +4,7 @@ A REST client for your terminal. Requests are files you can commit; the TUI is j
 
 ```
 curl -fsSL https://bun.sh/install | bash   # if you need it
-bunx r3q ./examples
+bunx @profullstack/r3q ./examples
 ```
 
 ![three panes: collection, request, response](#)

@@ -1,5 +1,5 @@
 {
-  "name": "r3q",
+  "name": "@profullstack/r3q",
   "version": "0.1.0",
   "description": "A REST client for your terminal. Requests are files you can commit; the TUI is just a good way to look at them.",
   "license": "MIT",
@@ -23,7 +23,8 @@
     "start": "bun src/main.ts",
     "build": "bun x tsc -p tsconfig.json",
     "typecheck": "bun x tsc -p tsconfig.json --noEmit",
-    "test": "bun test test"
+    "test": "bun test test",
+    "prepublishOnly": "bun run build"
   },
   "dependencies": {
     "@profullstack/hqtui": "^0.3.0"
@@ -43,5 +44,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/profullstack/r3q.git"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
