@@ -4,8 +4,12 @@ A REST client for your terminal. Requests are files you can commit; the TUI is j
 
 ```
 curl -fsSL https://bun.sh/install | bash   # if you need it
-bunx @profullstack/r3q ./examples
+mkdir -p ~/api
+bunx @profullstack/r3q ~/api
 ```
+
+Put `.http` request files in that directory, then press `r` to reload them.
+Use `bunx @profullstack/r3q --help` for usage or `bunx @profullstack/r3q --version` to check the installed release.
 
 ![three panes: collection, request, response](#)
 

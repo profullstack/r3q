@@ -65,8 +65,17 @@ const methodColor = (theme: Record<string, number>, method: string): number => (
   PATCH: theme.warning, DELETE: theme.danger,
 }[method] ?? theme.secondary) as number;
 
-async function main(): Promise<void> {
-  const root = resolve(process.argv[2] ?? ".");
+export async function main(args = process.argv.slice(2)): Promise<void> {
+  if (args[0] === "--help" || args[0] === "-h") {
+    console.log("Usage: r3q [directory]\n\nOpen .http request files in a terminal REST client.\n\nKeys: Enter send, Tab switch panes, r reload, q quit.\n\nOptions:\n  -h, --help     Show this help\n  -v, --version  Show the installed version");
+    return;
+  }
+  if (args[0] === "--version" || args[0] === "-v") {
+    const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    console.log(`r3q ${version}`);
+    return;
+  }
+  const root = resolve(args[0] ?? ".");
   const state = createState(root);
 
   const app = await createApp({ theme: themes.dark, title: "r3q", quitKeys: ["ctrl+c"] });
