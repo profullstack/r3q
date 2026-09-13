@@ -72,6 +72,15 @@ test("an empty collection says so rather than rendering a blank pane", () => {
   assert.match(out, /No \.http files/);
 });
 
+test("a collection scan renders a loading state instead of claiming the directory is empty", () => {
+  const out = frame((s) => { s.requests = []; s.loading = true; });
+  assert.match(out, /Loading request files/);
+  assert.match(out, /Collection/);
+  assert.match(out, /Request/);
+  assert.match(out, /Response/);
+  assert.doesNotMatch(out, /No \.http files/);
+});
+
 test("the layout survives a narrow terminal", () => {
   const state = createState(EXAMPLES);
   const out = renderToText((args) => view(args as never, state), { width: 40, height: 20 });

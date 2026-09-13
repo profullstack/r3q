@@ -7,7 +7,7 @@
  * Three panes: the collection, the request, the response. Enter sends.
  */
 import { createApp, themes, type Container, type KeyEvent, type Theme } from "@profullstack/hqtui";
-import { resolveRequest, scanCollection, type RequestFile, type Scan } from "./collection.ts";
+import { scanCollection, scanCollectionAsync, resolveRequest, type RequestFile, type Scan } from "./collection.ts";
 import { formatBody, send, statusKind, type Exchange } from "./send.ts";
 import { highlightBody, type JsonPalette } from "./highlight.ts";
 import { readFileSync } from "node:fs";
@@ -24,6 +24,7 @@ export interface State {
   vars: Record<string, string>;
   root: string;
   note: string;
+  loading: boolean;
 }
 
 /** Variables come from `.env` beside the collection, then the environment. */
@@ -46,13 +47,12 @@ function loadVars(root: string): Record<string, string> {
   return vars;
 }
 
-/** What the scan could not promise, when it stopped at a limit. */
+/** Explain when the collection exceeds the scan limits. */
 export function scanNote(scan: Pick<Scan, "dirs" | "truncated">): string {
   return scan.truncated ? `stopped scanning after ${scan.dirs} directories; point r3q at your collection` : "";
 }
 
-export function createState(root: string): State {
-  const scan = scanCollection(root);
+export function createState(root: string, scan = scanCollection(root)): State {
   return {
     requests: scan.requests,
     selected: 0,
@@ -63,6 +63,7 @@ export function createState(root: string): State {
     vars: loadVars(root),
     root,
     note: scanNote(scan),
+    loading: false,
   };
 }
 
@@ -80,9 +81,40 @@ export async function main(): Promise<void> {
     return;
   }
   const root = resolve(process.argv[2] ?? ".");
-  const state = createState(root);
+  const state = createState(root, { requests: [], dirs: 0, truncated: false });
 
   const app = await createApp({ theme: themes.dark, title: "r3q", quitKeys: ["ctrl+c"] });
+
+  let scanController: AbortController | undefined;
+  const reload = async (): Promise<void> => {
+    scanController?.abort();
+    const controller = new AbortController();
+    scanController = controller;
+    state.requests = [];
+    state.selected = 0;
+    state.offset = 0;
+    state.loading = true;
+    state.note = "";
+    state.vars = loadVars(root);
+    app.invalidate();
+    try {
+      const scan = await scanCollectionAsync(root, {
+        signal: controller.signal,
+        onRequest: (request) => {
+          state.requests.push(request);
+          app.invalidate();
+        },
+      });
+      if (!controller.signal.aborted) state.note = scanNote(scan);
+    } catch (error) {
+      if (!controller.signal.aborted) state.note = String(error);
+    } finally {
+      if (!controller.signal.aborted) {
+        state.loading = false;
+        app.invalidate();
+      }
+    }
+  };
 
   const current = (): RequestFile | undefined => state.requests[state.selected];
 
@@ -104,12 +136,7 @@ export async function main(): Promise<void> {
     switch (event.key) {
       case "q": app.quit(); return;
       case "tab": state.pane = state.pane === "collection" ? "response" : "collection"; return;
-      case "r": {
-        const scan = scanCollection(state.root);
-        state.requests = scan.requests;
-        state.note = scanNote(scan) || "reloaded";
-        return;
-      }
+      case "r": void reload(); return;
       case "enter": void fire(); return;
       case "up":
         if (state.pane === "collection") state.selected = Math.max(0, state.selected - 1);
@@ -127,7 +154,12 @@ export async function main(): Promise<void> {
   });
 
   app.render((args) => view(args, state));
-  await app.start();
+  void reload();
+  try {
+    await app.start();
+  } finally {
+    scanController?.abort();
+  }
 }
 
 
@@ -153,7 +185,7 @@ export function view(
       header.text(" r3q", { fg: theme.title, bold: true, size: 6 });
       header.text(state.root, { fg: theme.muted });
       header.text(
-        `${state.requests.length} requests  Tab panes  Enter send  r reload  q quit `,
+        `${state.loading ? "Loading… " : ""}${state.requests.length} requests  Tab panes  Enter send  r reload  q quit `,
         { fg: theme.muted, align: "right" },
       );
     });
@@ -165,6 +197,10 @@ export function view(
         borderColor: state.pane === "collection" ? theme.borderFocused : theme.border,
       }, (p) => {
         if (state.requests.length === 0) {
+          if (state.loading) {
+            p.label("Loading request files…");
+            return;
+          }
           p.label(`No .http files under ${state.root}`);
           p.label("Create one and press r to reload.");
           return;

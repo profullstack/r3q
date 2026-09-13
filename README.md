@@ -41,6 +41,10 @@ Authorization: Bearer {{TOKEN}}
 
 A blank line ends the headers and begins the body. That's the whole format.
 
+Collections load in the background, so the terminal opens immediately even in a large directory.
+Requests appear as they are found; `r` restarts the scan and `q` stops it and quits.
+Hidden directories, `node_modules`, and symlinks are skipped.
+
 Because a request is a file, it diffs, reviews and merges like everything else in the repository. There is no binary workspace to export from, and no account to sign into.
 
 ## Secrets stay out of the files
