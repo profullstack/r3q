@@ -1,8 +1,8 @@
 /**
  * r3q — a REST client for your terminal.
  *
- *   bunx r3q            # the collection in the working directory
- *   bunx r3q ./api      # a collection somewhere else
+ *   bunx @profullstack/r3q            # the collection in the working directory
+ *   bunx @profullstack/r3q ./api      # a collection somewhere else
  *
  * Three panes: the collection, the request, the response. Enter sends.
  */
