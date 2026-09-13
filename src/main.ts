@@ -65,7 +65,14 @@ const methodColor = (theme: Record<string, number>, method: string): number => (
   PATCH: theme.warning, DELETE: theme.danger,
 }[method] ?? theme.secondary) as number;
 
-async function main(): Promise<void> {
+export const USAGE = `Usage:
+  r3q [dir]   browse the .http files in dir (default: the working directory); Enter sends`;
+
+export async function main(): Promise<void> {
+  if (process.argv.slice(2).some((a) => a === "-h" || a === "--help")) {
+    console.log(USAGE);
+    return;
+  }
   const root = resolve(process.argv[2] ?? ".");
   const state = createState(root);
 
