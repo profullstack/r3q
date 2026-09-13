@@ -3,7 +3,8 @@
  * workspace: a request is a file, so it diffs, reviews and merges like the rest
  * of the repository it lives in.
  */
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 
 export interface RequestFile {
@@ -111,29 +112,23 @@ export function scanCollection(root: string, limits: ScanLimits = SCAN_LIMITS): 
       return;
     }
     dirs += 1;
-    let entries: string[];
+    let entries;
     try {
-      entries = readdirSync(dir).sort();
+      entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
     } catch {
       return;
     }
     for (const entry of entries) {
       if (stopped) return;
-      if (entry.startsWith(".") || entry === "node_modules") continue;
-      const full = join(dir, entry);
-      let stats;
-      try {
-        stats = statSync(full);
-      } catch {
-        continue;
-      }
-      if (stats.isDirectory()) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
         if (depth >= limits.maxDepth) {
           truncated = true;
           continue;
         }
         walk(full, depth + 1);
-      } else if (entry.endsWith(".http")) {
+      } else if (entry.isFile() && entry.name.endsWith(".http")) {
         const id = relative(root, full).split(sep).join("/");
         try {
           out.push(parseRequest(readFileSync(full, "utf8"), id, full));
@@ -153,6 +148,70 @@ export function scanCollection(root: string, limits: ScanLimits = SCAN_LIMITS): 
 /** The requests alone, scanned within the default limits. */
 export function loadCollection(root: string): RequestFile[] {
   return scanCollection(root).requests;
+}
+
+/** Scan without blocking rendering or keyboard input, publishing each request as it is found. */
+export async function scanCollectionAsync(
+  root: string,
+  options: { signal?: AbortSignal; onRequest?: (request: RequestFile) => void; limits?: ScanLimits } = {},
+): Promise<Scan> {
+  const out: RequestFile[] = [];
+  const limits = options.limits ?? SCAN_LIMITS;
+  let dirs = 0;
+  let truncated = false;
+  let stopped = false;
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (options.signal?.aborted || stopped) return;
+    if (dirs >= limits.maxDirs) {
+      stopped = true;
+      truncated = true;
+      return;
+    }
+    dirs += 1;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (options.signal?.aborted || stopped) return;
+      if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (depth >= limits.maxDepth) {
+          truncated = true;
+          continue;
+        }
+        await walk(full, depth + 1);
+      } else if (entry.isFile() && entry.name.endsWith(".http")) {
+        const id = relative(root, full).split(sep).join("/");
+        let request: RequestFile;
+        try {
+          request = parseRequest(await readFile(full, { encoding: "utf8", signal: options.signal }), id, full);
+        } catch (error) {
+          if (options.signal?.aborted) return;
+          request = {
+            id, path: full, method: "GET", url: "", headers: {},
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+        if (options.signal?.aborted) return;
+        out.push(request);
+        options.onRequest?.(request);
+      }
+    }
+  };
+  await walk(root, 0);
+  return { requests: out, dirs, truncated };
+}
+
+export async function loadCollectionAsync(
+  root: string,
+  options: { signal?: AbortSignal; onRequest?: (request: RequestFile) => void } = {},
+): Promise<RequestFile[]> {
+  return (await scanCollectionAsync(root, options)).requests;
 }
 
 /**

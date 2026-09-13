@@ -1,6 +1,6 @@
 {
   "name": "@profullstack/r3q",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A REST client for your terminal. Requests are files you can commit; the TUI is just a good way to look at them.",
   "license": "MIT",
   "type": "module",
