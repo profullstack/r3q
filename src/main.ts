@@ -7,7 +7,7 @@
  * Three panes: the collection, the request, the response. Enter sends.
  */
 import { createApp, themes, type Container, type KeyEvent, type Theme } from "@profullstack/hqtui";
-import { loadCollection, resolveRequest, type RequestFile } from "./collection.ts";
+import { resolveRequest, scanCollection, type RequestFile, type Scan } from "./collection.ts";
 import { formatBody, send, statusKind, type Exchange } from "./send.ts";
 import { highlightBody, type JsonPalette } from "./highlight.ts";
 import { readFileSync } from "node:fs";
@@ -46,9 +46,15 @@ function loadVars(root: string): Record<string, string> {
   return vars;
 }
 
+/** What the scan could not promise, when it stopped at a limit. */
+export function scanNote(scan: Pick<Scan, "dirs" | "truncated">): string {
+  return scan.truncated ? `stopped scanning after ${scan.dirs} directories; point r3q at your collection` : "";
+}
+
 export function createState(root: string): State {
+  const scan = scanCollection(root);
   return {
-    requests: loadCollection(root),
+    requests: scan.requests,
     selected: 0,
     offset: 0,
     bodyOffset: 0,
@@ -56,7 +62,7 @@ export function createState(root: string): State {
     pane: "collection",
     vars: loadVars(root),
     root,
-    note: "",
+    note: scanNote(scan),
   };
 }
 
@@ -98,7 +104,12 @@ export async function main(): Promise<void> {
     switch (event.key) {
       case "q": app.quit(); return;
       case "tab": state.pane = state.pane === "collection" ? "response" : "collection"; return;
-      case "r": state.requests = loadCollection(state.root); state.note = "reloaded"; return;
+      case "r": {
+        const scan = scanCollection(state.root);
+        state.requests = scan.requests;
+        state.note = scanNote(scan) || "reloaded";
+        return;
+      }
       case "enter": void fire(); return;
       case "up":
         if (state.pane === "collection") state.selected = Math.max(0, state.selected - 1);

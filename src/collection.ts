@@ -73,10 +73,44 @@ export function parseRequest(source: string, id: string, path: string): RequestF
   };
 }
 
-/** Every `.http` file under `root`, depth first, in a stable order. */
-export function loadCollection(root: string): RequestFile[] {
+export interface ScanLimits {
+  /** How deep below the root the walk goes. */
+  maxDepth: number;
+  /** How many directories it reads before it stops. */
+  maxDirs: number;
+}
+
+/**
+ * Enough for any collection, and small enough that a home directory with
+ * hundreds of repositories under it comes back in well under a second
+ * instead of minutes, which is what `r3q` in the wrong directory used to do.
+ */
+export const SCAN_LIMITS: ScanLimits = { maxDepth: 8, maxDirs: 2000 };
+
+export interface Scan {
+  requests: RequestFile[];
+  /** Directories read. */
+  dirs: number;
+  /** The walk stopped at a limit, so there may be requests it never saw. */
+  truncated: boolean;
+}
+
+/** Every `.http` file under `root`, depth first, in a stable order, within the limits. */
+export function scanCollection(root: string, limits: ScanLimits = SCAN_LIMITS): Scan {
   const out: RequestFile[] = [];
-  const walk = (dir: string): void => {
+  let dirs = 0;
+  let truncated = false;
+  // The directory cap ends the whole walk; the depth limit only skips the
+  // subtree it was reached in, so one deep tree does not hide its siblings.
+  let stopped = false;
+  const walk = (dir: string, depth: number): void => {
+    if (stopped) return;
+    if (dirs >= limits.maxDirs) {
+      stopped = true;
+      truncated = true;
+      return;
+    }
+    dirs += 1;
     let entries: string[];
     try {
       entries = readdirSync(dir).sort();
@@ -84,6 +118,7 @@ export function loadCollection(root: string): RequestFile[] {
       return;
     }
     for (const entry of entries) {
+      if (stopped) return;
       if (entry.startsWith(".") || entry === "node_modules") continue;
       const full = join(dir, entry);
       let stats;
@@ -93,7 +128,11 @@ export function loadCollection(root: string): RequestFile[] {
         continue;
       }
       if (stats.isDirectory()) {
-        walk(full);
+        if (depth >= limits.maxDepth) {
+          truncated = true;
+          continue;
+        }
+        walk(full, depth + 1);
       } else if (entry.endsWith(".http")) {
         const id = relative(root, full).split(sep).join("/");
         try {
@@ -107,8 +146,13 @@ export function loadCollection(root: string): RequestFile[] {
       }
     }
   };
-  walk(root);
-  return out;
+  walk(root, 0);
+  return { requests: out, dirs, truncated };
+}
+
+/** The requests alone, scanned within the default limits. */
+export function loadCollection(root: string): RequestFile[] {
+  return scanCollection(root).requests;
 }
 
 /**
