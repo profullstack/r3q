@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-labelledby="title desc">
+  <title id="title">r3q</title>
+  <desc id="desc">The r3q terminal REST client: a cyan request arrow and lime response arrow beside a rounded lowercase wordmark.</desc>
+  <rect x="1" y="1" width="1198" height="398" rx="28" fill="#081119" stroke="#23333F" stroke-width="2"/>
+  <g transform="translate(130 74)">
+    <rect width="252" height="252" rx="48" fill="#101820"/>
+    <g fill="none" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M52 82H200M158 42L200 82L158 122" stroke="#39D5E8"/>
+      <path d="M200 176H52M94 136L52 176L94 216" stroke="#C6F36B"/>
+    </g>
+  </g>
+  <g fill="none" stroke="#EAF4F8" stroke-width="46" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M470 276V163M470 208Q470 163 518 163H545"/>
+    <path d="M616 136H683Q728 136 728 174Q728 211 683 211H644M683 211Q736 211 736 254Q736 294 683 294H611"/>
+    <path d="M918 181V344M918 231C918 190 893 162 852 162C811 162 787 190 787 231C787 271 812 297 852 297C893 297 918 271 918 231Z"/>
+  </g>
+</svg>

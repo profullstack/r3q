@@ -1,13 +1,18 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/profullstack/r3q/main/logo.svg" alt="r3q — a REST client for your terminal" width="800" />
+</p>
+
 # r3q
 
 A REST client for your terminal. Requests are files you can commit; the TUI is just a good way to look at them.
 
 ```
 curl -fsSL https://bun.sh/install | bash   # if you need it
-bunx @profullstack/r3q ./examples
+mkdir -p ~/api
+bunx @profullstack/r3q ~/api
 ```
 
-![three panes: collection, request, response](#)
+Add `.http` request files to `~/api` (see the example below), then press `r` to reload the collection.
 
 ```
  r3q  ~/api                                        3 requests  Tab panes  Enter send  r reload  q quit
@@ -28,7 +33,7 @@ bunx @profullstack/r3q ./examples
 
 ## Requests are files
 
-A request is a `.http` file, the format your editor already understands:
+A request is a `.http` file, the format your editor already understands. Save this as `~/api/example.http`:
 
 ```http
 # Comments before the request line are ignored.
@@ -79,6 +84,12 @@ Early. It sends requests, resolves variables, and shows you the whole exchange. 
 ## Built with
 
 [hqtui](https://hqtui.com) — the terminal UI library. r3q exists partly to keep hqtui honest: a real application finds the gaps that a widget gallery does not.
+
+## Brand assets
+
+[Logo SVG](logo.svg) · [Logo PNG](logo.png) · [Favicon SVG](favicon.svg) · [Favicon PNG](favicon.png)
+
+Both logo banners work on light and dark backgrounds. The favicon PNG has a transparent background. See [asset provenance and generation prompts](docs/branding.md).
 
 ## Licence
 

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">r3q icon</title>
+  <desc id="desc">A cyan request arrow points right above a lime response arrow pointing left on a dark rounded tile.</desc>
+  <rect x="16" y="16" width="224" height="224" rx="44" fill="#101820"/>
+  <g fill="none" stroke-width="23" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M64 88H194M157 52L194 88L157 124" stroke="#39D5E8"/>
+    <path d="M194 172H64M101 136L64 172L101 208" stroke="#C6F36B"/>
+  </g>
+</svg>
