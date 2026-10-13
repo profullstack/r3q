@@ -6,11 +6,15 @@
 
 A REST client for your terminal. Requests are files you can commit; the TUI is just a good way to look at them.
 
-```
-curl -fsSL https://bun.sh/install | bash   # if you need it
+```sh
+curl -fsSL https://raw.githubusercontent.com/profullstack/r3q/main/install.sh | sh
 mkdir -p ~/api
-bunx @profullstack/r3q ~/api
+r3q ~/api
 ```
+
+The installer puts the `r3q` command in `~/.local` (no root). It uses your Node 22+ if you have one,
+otherwise it fetches an official Node build (checksum verified) into `~/.local/share/r3q`. Re-run it
+to upgrade; remove it with `sh ~/.local/share/r3q/uninstall.sh`. Without installing: `bunx @profullstack/r3q ~/api`.
 
 Click **New request** or press `n` in the empty collection. Choose a method, edit the prefilled name, file path, URL, headers and body, then review and save. The new `.http` file is selected immediately. Press `Enter` when you want to send it.
 
