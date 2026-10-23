@@ -12,7 +12,15 @@ import { formatBody, send, statusKind, type Exchange } from "./send.ts";
 import { highlightBody, type JsonPalette } from "./highlight.ts";
 import { RequestManager } from "./request-manager.ts";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { hostname, userInfo } from "node:os";
+import { CLI_USAGE, COMMANDS, cli } from "./cli.ts";
+import { toCurl } from "./http/convert.ts";
+import { Session, type RunResult } from "./http/runner.ts";
+import type { TestResult } from "./http/scripts.ts";
+import { PromptDialog } from "./prompt-dialog.ts";
+import { createOrg, createProject, loadBundle, readBundle, saveBundle, writeBundle } from "./workspace.ts";
 
 export interface State {
   requests: RequestFile[];
@@ -26,6 +34,14 @@ export interface State {
   root: string;
   note: string;
   loading: boolean;
+  /** Test results, log lines and streamed messages of the last send. */
+  tests?: TestResult[];
+  logs?: string[];
+  messages?: string[];
+  /** Active environment names (http-client.env.json, VS Code, httpyac). */
+  environments?: string[];
+  /** What was actually sent, once it has been. */
+  sent?: { method: string; url: string; headers: [string, string][]; body?: string };
 }
 
 /** Variables come from `.env` beside the collection, then the environment. */
@@ -74,23 +90,59 @@ const methodColor = (theme: Record<string, number>, method: string): number => (
 }[method] ?? theme.secondary) as number;
 
 export const USAGE = `Usage:
-  r3q [dir]   browse the .http files in dir (default: the working directory)
+  r3q [dir]   browse the .http/.rest files in dir (default: the working directory)
 
   n new request  v view file  e edit  d duplicate  x delete  r reload
+  s save response  c copy as curl  E environment  p new org/project
+  S save workspace bundle  L load bundle  Esc cancel a running request
   Enter sends the selected request, or starts the wizard in an empty collection
-  Saved requests are .http files. Deleted files move to .r3q-trash.`;
+  Saved requests are .http files. Deleted files move to .r3q-trash.
+
+${CLI_USAGE}`;
+
+/** The runner's result as the response pane shows it. */
+export function toExchange(result: RunResult): Exchange {
+  const res = result.response;
+  if (!res) {
+    return { status: 0, statusText: "", headers: [], body: "", ms: 0, bytes: 0, contentType: "", error: result.error ?? (result.skipped ? `not sent: ${result.skipped}` : "no response") };
+  }
+  return {
+    status: res.status, statusText: res.statusText, headers: [...res.headers].sort((a, b) => a[0].localeCompare(b[0])),
+    body: result.messages?.length ? result.messages.join("\n") : res.text, ms: res.duration, bytes: res.body.length, contentType: res.contentType,
+    error: result.error ?? (res.status === 0 ? res.statusText || "failed" : undefined),
+  };
+}
+
+/** OSC 52: put text on the terminal's clipboard, local or over ssh. */
+function copyToClipboard(text: string): void {
+  process.stdout.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
+}
 
 export async function main(): Promise<void> {
-  if (process.argv.slice(2).some((a) => a === "-h" || a === "--help")) {
+  const argv = process.argv.slice(2);
+  if (argv.some((a) => a === "-h" || a === "--help")) {
     console.log(USAGE);
     return;
   }
-  const root = resolve(process.argv[2] ?? ".");
+  if ((COMMANDS as readonly string[]).includes(argv[0] ?? "")) {
+    process.exitCode = await cli(argv);
+    return;
+  }
+  const root = resolve(argv[0] ?? ".");
   const state = createState(root, { requests: [], dirs: 0, truncated: false });
 
   // The form owns cursor movement and Tab order, including multiline fields.
   const app = await createApp({ theme: themes.dark, title: "r3q", quitKeys: ["ctrl+c"], focusNavigation: false });
 
+  const dialog = new PromptDialog(() => app.invalidate(), (line) => { (state.logs ??= []).push(line); app.invalidate(); });
+  const session = new Session({
+    root, interaction: dialog, cookieFile: join(root, ".r3q", "cookies.json"),
+    onEvent: (event) => {
+      if (event.kind === "message") (state.messages ??= []).push(event.text);
+      else (state.logs ??= []).push(event.text);
+      app.invalidate();
+    },
+  });
   let scanController: AbortController | undefined;
   const reload = async (selectId = state.requests[state.selected]?.id, note = ""): Promise<void> => {
     scanController?.abort();
@@ -136,6 +188,7 @@ export async function main(): Promise<void> {
     note: (note) => { state.note = note; app.invalidate(); },
   });
 
+  let lastResult: RunResult | undefined;
   const fire = async (): Promise<void> => {
     const request = current();
     if (!request || state.sending) return;
@@ -143,20 +196,123 @@ export async function main(): Promise<void> {
     state.sending = true;
     state.note = "";
     state.exchange = undefined;
+    state.tests = [];
+    state.logs = [];
+    state.messages = [];
+    state.sent = undefined;
     state.bodyOffset = 0;
     app.invalidate();
-    state.exchange = await send(resolveRequest(request, state.vars));
+    try {
+      const file = await session.load(request.path);
+      let result: RunResult;
+      if (request.method === "RUN") {
+        const run = file.runs[request.index ?? 0];
+        if (!run) throw new Error("run directive not found; press r to reload");
+        const results = await session.runDirective(file, run);
+        const final = results[results.length - 1];
+        if (!final) throw new Error("nothing ran");
+        result = { ...final, tests: results.flatMap((r) => r.tests) };
+      } else {
+        const target = file.requests[request.index ?? 0];
+        if (!target) throw new Error("this request moved; press r to reload");
+        result = await session.run(file, target);
+      }
+      lastResult = result;
+      state.exchange = toExchange(result);
+      state.tests = result.tests;
+      if (result.prepared) state.sent = { method: result.prepared.method, url: result.prepared.url, headers: result.prepared.headers, body: result.prepared.bodyText };
+      if (result.savedTo) state.note = `saved ${result.savedTo}`;
+      if (result.iterations) state.note = `@loop ran ${result.iterations.length} times`;
+    } catch (error) {
+      state.exchange = { status: 0, statusText: "", headers: [], body: "", ms: 0, bytes: 0, contentType: "", error: error instanceof Error ? error.message : String(error) };
+    }
     state.sending = false;
     app.invalidate();
   };
 
+  const ask = async (message: string, fallback: string): Promise<string | undefined> => {
+    const answer = await dialog.prompt(message, { default: fallback });
+    return answer?.trim() || undefined;
+  };
+  const fail = (error: unknown): void => { state.note = error instanceof Error ? error.message : String(error); app.invalidate(); };
+  const saveResponse = async (): Promise<void> => {
+    const res = lastResult?.response;
+    if (!lastResult || !res) { state.note = "Send a request first; s saves its response."; app.invalidate(); return; }
+    const name = (lastResult.request.name ?? lastResult.request.title ?? "response").replace(/[^\w.-]+/g, "-");
+    const ext = /json/i.test(res.contentType) ? ".json" : /xml/i.test(res.contentType) ? ".xml" : /html/i.test(res.contentType) ? ".html" : /text/i.test(res.contentType) ? ".txt" : ".bin";
+    const path = await ask("Save the response body to", join(dirname(lastResult.file), "responses", `${name}${ext}`));
+    if (!path) return;
+    const target = resolve(root, path);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, res.body);
+    state.note = `saved ${target}`;
+    app.invalidate();
+  };
+  const saveWorkspace = async (): Promise<void> => {
+    const path = await ask("Save the workspace bundle (orgs, projects, requests, shared envs) to", join(root, "r3q-bundle.json"));
+    if (!path) return;
+    const secrets = await dialog.confirm("Include secrets (.env files, private env files, keys)?");
+    const { bundle, skipped } = await saveBundle(root, { secrets, savedBy: `${userInfo().username}@${hostname()}` });
+    await writeBundle(resolve(root, path), bundle);
+    state.note = `saved ${Object.keys(bundle.files).length} files to ${resolve(root, path)}${skipped.length ? ` (left out ${skipped.length})` : ""}; scp it, then r3q load it there`;
+    app.invalidate();
+  };
+  const loadWorkspace = async (): Promise<void> => {
+    const path = await ask("Load a workspace bundle from", join(root, "r3q-bundle.json"));
+    if (!path) return;
+    const bundle = await readBundle(resolve(root, path));
+    let report = await loadBundle(root, bundle);
+    let replaced = 0;
+    if (report.conflicts.length && await dialog.confirm(`${report.conflicts.length} file(s) differ locally (${report.conflicts.slice(0, 3).join(", ")}${report.conflicts.length > 3 ? ", ..." : ""}). Replace them? Local copies move to .r3q-trash.`)) {
+      const forced = await loadBundle(root, bundle, { force: true });
+      replaced = forced.replaced.length;
+      report = { ...report, conflicts: forced.conflicts };
+    }
+    await reload(undefined, `loaded bundle from ${bundle.savedBy ?? "?"}: ${report.written.length} new, ${replaced} replaced, ${report.unchanged.length} unchanged, ${report.conflicts.length} kept local`);
+  };
+  const chooseEnvironment = async (): Promise<void> => {
+    const names = await session.environmentNames(root);
+    if (!names.length) { state.note = "No environments: add http-client.env.json (or .vscode/settings.json, httpyac config)."; app.invalidate(); return; }
+    const pick = await dialog.pick("Environment", ["(none)", ...names]);
+    if (pick === undefined) return;
+    session.setEnvironments(pick === "(none)" ? [] : [pick]);
+    state.environments = session.environments;
+    state.note = `environment: ${pick}`;
+    app.invalidate();
+  };
+  const newProject = async (): Promise<void> => {
+    const org = await ask("Organization", current()?.org ?? "");
+    if (!org) return;
+    const project = await ask("Project (a team's workspace)", "");
+    if (!project) return;
+    const team = await dialog.prompt("Team members, comma separated (optional)", { default: "" });
+    const orgSlug = await createOrg(root, org);
+    const slug = await createProject(root, orgSlug, project, { team: team ? team.split(",").map((m) => m.trim()).filter(Boolean) : undefined });
+    manager.create(`${orgSlug}/${slug}`);
+  };
+  const copyCurl = (): void => {
+    const sent = lastResult?.prepared;
+    if (!sent) { state.note = "Send the request first; c copies what was sent as curl."; app.invalidate(); return; }
+    copyToClipboard(toCurl(sent));
+    state.note = "copied as curl";
+    app.invalidate();
+  };
+
   app.on("key", (event: KeyEvent) => {
+    if (dialog.open) { dialog.key(event); return; }
     if (manager.dialog) { manager.key(event); return; }
     switch (event.key) {
+      case "escape": if (state.sending) { session.abort(); state.note = "cancelled"; } return;
+      case "s": saveResponse().catch(fail); return;
+      case "S": case "shift+s": saveWorkspace().catch(fail); return;
+      case "L": case "shift+l": loadWorkspace().catch(fail); return;
+      case "E": case "shift+e": chooseEnvironment().catch(fail); return;
+      case "c": copyCurl(); return;
+      case "p": newProject().catch(fail); return;
       case "q": app.quit(); return;
       case "tab": state.pane = state.pane === "collection" ? "response" : "collection"; return;
       case "r": void reload(); return;
-      case "n": manager.create(); return;
+      case "n": manager.create(current()?.org && current()?.project ? `${current()!.org}/${current()!.project}` : ""); return;
       case "v": void manager.open("view"); return;
       case "e": void manager.open("edit"); return;
       case "d": void manager.open("duplicate"); return;
@@ -176,7 +332,7 @@ export async function main(): Promise<void> {
       case "home": state.bodyOffset = 0; return;
     }
   });
-  app.on("paste", (event) => manager.paste(event.text));
+  app.on("paste", (event) => { if (dialog.open) dialog.paste(event.text); else manager.paste(event.text); });
 
   app.render((args) => {
     view(args, state, {
@@ -186,12 +342,14 @@ export async function main(): Promise<void> {
       send: () => { if (state.requests.length === 0) manager.create(); else void fire(); },
     });
     manager.render(args.ui, args.theme, args.width, args.height);
+    dialog.render(args.ui, args.theme, args.width, args.height);
   });
   void reload();
   try {
     await app.start();
   } finally {
     scanController?.abort();
+    session.abort();
   }
 }
 
@@ -219,7 +377,7 @@ export function view(
       header.text(" r3q", { fg: theme.title, bold: true, size: 6 });
       header.text(state.root, { fg: theme.muted });
       header.text(
-        `${state.loading ? "Loading… " : ""}${state.requests.length} requests  n new  Enter send  q quit `,
+        `${state.loading ? "Loading… " : ""}${state.requests.length} requests  env ${state.environments?.join("+") || "none"} (E)  n new  Enter send  q quit `,
         { fg: theme.muted, align: "right" },
       );
     });
@@ -245,7 +403,7 @@ export function view(
         p.table({
           rows: state.requests.map((r) => ({
             method: r.error ? "ERR" : r.method,
-            name: r.id,
+            name: (r.siblings ?? 1) > 1 ? `${r.file} › ${r.label ?? `#${(r.index ?? 0) + 1}`}` : r.id,
           })),
           selected: state.selected,
           offset: state.offset,
@@ -275,7 +433,10 @@ export function view(
             p.text(`${request.id}: ${request.error}`, { fg: theme.danger, wrap: true });
             return;
           }
-          const resolved = resolveRequest(request, state.vars);
+          // Before a send: the file with .env values filled in. After: exactly what went out.
+          const preview = resolveRequest(request, state.vars);
+          const sent = state.sent && state.exchange ? state.sent : undefined;
+          const resolved = sent ? { method: sent.method, url: sent.url, headers: Object.fromEntries(sent.headers), body: sent.body } : preview;
           p.row({ size: 1 }, (r) => {
             r.badge({ text: resolved.method, color: methodColor(theme as never, resolved.method), size: 8 });
             r.text(` ${resolved.url}`, { fg: theme.foreground });
@@ -309,6 +470,10 @@ export function view(
           if (state.note !== "") p.text(state.note, { fg: theme.warning, size: 1 });
           if (state.sending) { p.label("Waiting for the server…"); return; }
           if (!exchange) { p.label("No response yet."); return; }
+          for (const t of state.tests ?? []) {
+            p.text(`${t.passed ? "✓" : "✗"} ${t.name}${t.message ? `: ${t.message}` : ""}`, { fg: t.passed ? theme.success : theme.danger, size: 1 });
+          }
+          for (const line of (state.logs ?? []).slice(-3)) p.text(line, { fg: theme.muted, size: 1 });
           if (exchange.error) { p.text(exchange.error, { fg: theme.danger, wrap: true }); return; }
           p.keyValues(
             exchange.headers.slice(0, 4).map(([k, v]) => ({ label: `${k}:`, value: v, color: theme.muted })),
@@ -336,6 +501,10 @@ export function view(
         { key: "d", label: "Duplicate", onPress: () => actions?.open("duplicate") },
         { key: "x", label: "Delete", onPress: () => actions?.open("delete") },
         { key: "Enter", label: state.requests.length ? "Send" : "New", onPress: actions?.send },
+        { key: "s", label: "Save resp" },
+        { key: "S/L", label: "Save/Load bundle" },
+        { key: "E", label: "Env" },
+        { key: "p", label: "Project" },
         { key: "Tab", label: state.pane === "collection" ? "Collection" : "Response", active: true },
         { key: "r", label: "Reload", onPress: actions?.reload },
         { key: "q", label: "Quit" },

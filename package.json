@@ -1,6 +1,6 @@
 {
   "name": "@profullstack/r3q",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "A REST client for your terminal. Requests are files you can commit; the TUI is just a good way to look at them.",
   "license": "MIT",
   "type": "module",
@@ -29,6 +29,12 @@
   },
   "dependencies": {
     "@profullstack/hqtui": "^0.6.2"
+  },
+  "optionalDependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.7.13",
+    "amqplib": "^0.10.4",
+    "mqtt": "^5.10.0"
   },
   "devDependencies": {
     "@types/node": "^26",

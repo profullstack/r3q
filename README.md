@@ -73,7 +73,28 @@ Authorization: Bearer {{TOKEN}}
 {"name": "thing"}
 ```
 
-A blank line ends the headers and begins the body. That's the whole format.
+A blank line ends the headers and begins the body. `###` separates requests, so one file can hold a whole flow; each request is its own row in the collection.
+
+r3q implements the full [http-files.org spec](https://http-files.org/spec/basics/): the universal core plus the extensions of VS Code REST Client, JetBrains HTTP Client, httpyac, Visual Studio 2022 and kulala.nvim, so a file written for any of them runs here.
+
+| Spec page | Supported |
+|---|---|
+| Basics, Requests | `.http` and `.rest`, UTF-8, `###` blocks and titles, method defaults to GET, `HTTP/1.1`/`HTTP/2`, every WebDAV and httpyac method, indented URL continuation and `?`/`&` lines, indented header values, `...spread` headers, multi-line urlencoded forms, non-ASCII URLs percent-encoded once |
+| Separators & comments | `#`, `//`, `/* */`, `### title`, global regions (a block with no request applies its variables, metadata and scripts to every request) |
+| Variables | `@name = value`, lazy `@name := value`, `{{name}}`, `{{%name}}`, request variables `{{login.response.body.$.token}}`, `.body.//xpath`, `.body.*`, `.headers.X`, `.request.body.*`, httpyac `@ref` + `{{login.token}}`, JavaScript in `{{ }}` |
+| Dynamic variables | `$guid` `$uuid` `$random.uuid` `$randomInt [min max]` `$random.integer/float/alphabetic/alphanumeric/hexadecimal/email` and the Faker categories (`$random.name.fullName`, `$random.address.city`, …), `$timestamp`/`$datetime`/`$localDatetime` with offsets and Day.js formats, `$isoTimestamp`, `$processEnv`, `$dotenv`, `$env.X`, `$projectRoot`, `$input`, `$password`, `$pick`, `$input-askonce`, `$aadToken`, `$aadV2Token`, `$oidcAccessToken` |
+| Environments | `http-client.env.json` + `.private.env.json` + `.env.json.user`, `.vscode/settings.json` (`$shared`), `.env`, `.env.<name>`, `<name>.env`, `.env.local`, `httpyac.config.js`/`.httpyac.json`/`package.json`, `env/` dirs, `$HTTPYAC_ENV`, nested values, Visual Studio secret providers (User Secrets, Azure Key Vault via `az`); several environments at once |
+| Metadata | `@name` `@no-redirect` `@no-cookie-jar` `@note` `@no-log` `@timeout` `@connection-timeout` `@no-auto-encoding` `@ref` `@forceRef` `@import` `@disabled` `@loop` `@sleep` `@jwt` `@save` `@ratelimit` `@proxy` `@no-reject-unauthorized` `@no-client-cert` `@keepStreaming` `@injectVariables` `@debug` `@verbose` `@prompt` `@secret` `@delay` `@curl-*` `@grpc-*` `@jq` `@env-json-key` `@env-header-key` |
+| Authentication | Basic (`user password`, `user:password`, pre-encoded), Digest (challenge/response, MD5/SHA-256, `-sess`, `auth-int`), AWS Signature v4, AWS Cognito (SRP), OAuth2/OpenID (`client_credentials`, `password`, `authorization_code` + PKCE, `implicit`, `device_code`, token exchange) |
+| Cookies | a jar for every request (kept in `.r3q/cookies.json`, 300 max), `@no-cookie-jar` |
+| File operations | `< file`, `<@ file`, `<@latin1 file`, multipart with file parts, JetBrains `import`/`run file#name (@var=value)`, `>>` and `>>!`, `<>` compare |
+| GraphQL | `GRAPHQL` method (also over `ws://`), `X-REQUEST-TYPE: GraphQL`, httpyac `gql Name < ./query.gql` and auto-detection |
+| Scripts | JetBrains `< {% %}` / `> {% %}` / `> handler.js` with `client`, `request`, `response`, `crypto`; httpyac `{{ }}` blocks with `exports`, `require`, `test.*`, `sleep`, `@request`/`@response`/`@after` hooks and `{{+ }}` global scripts; `??` assertions (`status`, `header`, `body`, `duration`, `js`, `xpath`) |
+| Protocols | WebSocket (`===`, `=== wait-for-server`), SSE, gRPC (proto files or reflection, all four call types), MQTT, AMQP |
+| Proxy, SSL | `@proxy`, `request_proxy`, VS Code `http.proxy`, `HTTP(S)_PROXY`/`NO_PROXY`, SOCKS5; client certificates from VS Code, JetBrains `SSLConfiguration`, httpyac config and the `ClientCert:` header |
+| cURL | paste a curl command as a request, copy as curl (`c`), `r3q curl`, code generation in 20 languages, Postman/OpenAPI/Bruno import |
+
+Not possible from a terminal program: `@use-os-credentials` (NTLM/Kerberos through the operating system) fails with an explanation. Scripts are your own code and run with your permissions when you send, as in every client that supports them.
 
 Collections load in the background, so the terminal opens immediately even in a large directory.
 Requests appear as they are found; `r` restarts the scan and `q` stops it and quits.
@@ -89,7 +110,42 @@ Because a request is a file, it diffs, reviews and merges like everything else i
 TOKEN=sk-live-xxxxx
 ```
 
-`.env` is gitignored by default.
+`.env` is gitignored by default. Press `E` to switch between environments from `http-client.env.json` and the other formats above.
+
+## Organizations, projects and sharing
+
+There is no server. A workspace is the collection directory: `<org>/<project>/` folders for the requests and an `r3q.json` holding names, descriptions and team members.
+
+```sh
+r3q org add "Acme"
+r3q project add acme billing --team ana@acme.test,bo@acme.test
+r3q tree
+```
+
+In the TUI, `p` creates an org and project and opens the wizard inside it; `n` on a request in a project creates the new one beside it.
+
+To share, save the workspace to one file, copy it, and load it on the other side:
+
+```sh
+r3q save team.json                 # or --org acme --project billing for part of it
+scp team.json other-host:
+ssh other-host r3q load team.json --root ~/api
+```
+
+`S` and `L` do the same from the TUI. A bundle is JSON with the requests, body files, `r3q.json` and shared environment files. `.env` files, private env files and keys are left out unless you pass `--secrets` (the bundle is then written mode 0600). Loading never overwrites a file that differs locally: it lists the conflicts, and `--force` (or confirming in the TUI) replaces them after moving the local copy to `.r3q-trash`.
+
+## From a script or CI
+
+```sh
+r3q run api/flow.http --all --env dev    # every request in order; exits 1 if a test or ?? fails
+r3q run 'api/flow.http#login' -o token.json
+r3q curl 'api/flow.http#login'
+r3q code python-requests 'api/flow.http#login'
+r3q import curl 'curl -X POST https://api.test/x -d a=1' -o x.http
+r3q import postman collection.json --out api/
+```
+
+`r3q --help` lists every command.
 
 ## Keys
 
@@ -105,11 +161,17 @@ TOKEN=sk-live-xxxxx
 | `↑` `↓` | Move the selection, or scroll the response body |
 | `PgUp` `PgDn` `Home` | Scroll the response body faster |
 | `r` | Reload the collection from disk |
+| `s` | Save the last response body to a file |
+| `S` / `L` | Save the workspace to a bundle / load one |
+| `E` | Choose the environment |
+| `p` | Create an org and project, then a request in it |
+| `c` | Copy the last request as curl (OSC 52, works over ssh) |
+| `Esc` | Cancel a request that is running |
 | `q` | Quit |
 
 ## Status
 
-Early. It creates and manages request files, resolves variables, sends requests, and shows syntax-highlighted JSON responses. Collection runs, assertions, cookie jars, and OpenAPI/Postman import are not implemented yet. The in-app editor handles files up to 1 MiB; larger or malformed request files can still be edited externally.
+The http-files.org spec is implemented (see the table above). The in-app wizard edits files that hold one request; a file with several requests is edited in your editor, and `v` shows it. The wizard handles files up to 1 MiB.
 
 ## Built with
 

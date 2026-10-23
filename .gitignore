@@ -3,3 +3,4 @@ dist/
 *.log
 .env
 .r3q-trash/
+.r3q/

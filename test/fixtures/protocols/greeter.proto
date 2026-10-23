@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package test.greeter;
+
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloReply);
+  rpc Count (CountRequest) returns (stream CountReply);
+  rpc Join (stream HelloRequest) returns (HelloReply);
+}
+
+message HelloRequest { string name = 1; }
+message HelloReply { string message = 1; }
+message CountRequest { int32 to = 1; }
+message CountReply { int32 n = 1; }
