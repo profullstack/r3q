@@ -1,0 +1,59 @@
+{
+  "info": { "name": "Demo API", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+  "variable": [{ "key": "baseUrl", "value": "https://api.example.com" }],
+  "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }] },
+  "item": [
+    {
+      "name": "Health check",
+      "request": { "method": "GET", "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] }, "auth": { "type": "noauth" } }
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "Get user",
+          "event": [{ "listen": "test", "script": { "exec": ["pm.test('ok', () => pm.response.to.have.status(200));"] } }],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }, { "key": "X-Off", "value": "1", "disabled": true }],
+            "url": { "raw": "{{baseUrl}}/users/:id", "variable": [{ "key": "id", "value": "42" }] }
+          }
+        },
+        {
+          "name": "Create user",
+          "event": [{ "listen": "prerequest", "script": { "exec": ["pm.variables.set('now', Date.now());"] } }],
+          "request": {
+            "method": "POST",
+            "auth": { "type": "basic", "basic": [{ "key": "username", "value": "admin" }, { "key": "password", "value": "s3cret" }] },
+            "body": { "mode": "raw", "raw": "{\"name\": \"Ada\"}", "options": { "raw": { "language": "json" } } },
+            "url": "{{baseUrl}}/users"
+          }
+        },
+        {
+          "name": "Admin",
+          "item": [
+            {
+              "name": "Upload avatar",
+              "request": {
+                "method": "POST",
+                "body": { "mode": "formdata", "formdata": [
+                  { "key": "caption", "value": "me", "type": "text" },
+                  { "key": "avatar", "type": "file", "src": "/tmp/avatar.png" }
+                ] },
+                "url": "{{baseUrl}}/admin/avatar"
+              }
+            },
+            {
+              "name": "Login form",
+              "request": {
+                "method": "POST",
+                "body": { "mode": "urlencoded", "urlencoded": [{ "key": "user", "value": "a b" }, { "key": "pass", "value": "{{pw}}" }] },
+                "url": "{{baseUrl}}/login"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

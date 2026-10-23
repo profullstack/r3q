@@ -1,0 +1,46 @@
+meta {
+  name: Create User
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/users
+  body: json
+  auth: bearer
+}
+
+headers {
+  Accept: application/json
+  ~X-Debug: 1
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "name": "Ada"
+  }
+}
+
+vars:pre-request {
+  stamp: 123
+}
+
+script:pre-request {
+  req.setHeader("X-Time", Date.now());
+}
+
+script:post-response {
+  bru.setVar("userId", res.body.id);
+}
+
+assert {
+  res.status: eq 201
+  res.body.name: eq "Ada"
+  res.headers.content-type: contains json
+  res.body.id: isDefined
+  ~res.body.skip: eq 1
+}
