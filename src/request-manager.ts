@@ -83,11 +83,24 @@ export class RequestManager {
     this.hooks = hooks;
   }
 
-  create(): void { this.dialog = editor(templateDraft(), "new"); this.hooks.invalidate(); }
+  /** `dir` (an `<org>/<project>` folder) prefixes the suggested file path. */
+  create(dir = ""): void {
+    const draft = templateDraft();
+    this.folder = dir ? `${dir.replace(/\/+$/, "")}/` : "";
+    draft.file = this.folder + draft.file;
+    this.dialog = editor(draft, "new");
+    this.hooks.invalidate();
+  }
+  private folder = "";
   close(): void { if (!this.dialog?.busy) { this.dialog = undefined; this.hooks.invalidate(); } }
 
-  async open(kind: "view" | "edit" | "duplicate" | "delete", id = this.hooks.current()?.id): Promise<void> {
+  async open(kind: "view" | "edit" | "duplicate" | "delete", id = this.hooks.current()?.file ?? this.hooks.current()?.id): Promise<void> {
     if (!id) { this.hooks.note("Select a request first, or press n to create one."); return; }
+    const siblings = this.hooks.current()?.file === id ? this.hooks.current()?.siblings ?? 1 : 1;
+    if ((kind === "edit" || kind === "duplicate") && siblings > 1) {
+      this.hooks.note(`${id} holds ${siblings} requests; edit it in your editor (the wizard edits single-request files). v views it.`);
+      return;
+    }
     try {
       const snapshot = await readSnapshot(this.root, id);
       if (kind === "view" || kind === "delete") {
@@ -109,7 +122,10 @@ export class RequestManager {
     if (dialog?.kind !== "editor") return;
     try {
       if (dialog.step === "template") {
+        const prefixed = this.folder !== "" && dialog.draft.file.startsWith(this.folder);
+        if (prefixed) dialog.draft.file = dialog.draft.file.slice(this.folder.length);
         changeTemplate(dialog.draft, dialog.template, dialog.mode === "new");
+        if (prefixed) dialog.draft.file = this.folder + dialog.draft.file;
         for (const field of FIELDS) dialog.cursors[field] = dialog.draft[field].length;
         dialog.step = "details";
       } else {
@@ -183,7 +199,7 @@ export class RequestManager {
     dialog.cursors[field] = cursor;
     if (field === "file") dialog.customFile = true;
     if (field === "name" && !dialog.customFile) {
-      dialog.draft.file = suggestedFilename(value);
+      dialog.draft.file = (dialog.mode === "new" ? this.folder : "") + suggestedFilename(value);
       dialog.cursors.file = dialog.draft.file.length;
     }
     dialog.error = "";

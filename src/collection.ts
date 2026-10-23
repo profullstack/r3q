@@ -6,6 +6,8 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
+import { parseHttpFile, requestLabel } from "./http/parse.ts";
+import type { HttpRequest } from "./http/types.ts";
 
 export interface RequestFile {
   /** Path relative to the collection root, used as the display name and id. */
@@ -17,6 +19,50 @@ export interface RequestFile {
   body?: string;
   /** Parse errors are carried rather than thrown: one bad file is not a crash. */
   error?: string;
+  /** The file this request lives in, relative to the root (a file may hold several requests). */
+  file?: string;
+  /** Position within the file, 0-based. */
+  index?: number;
+  /** How many requests the file holds. */
+  siblings?: number;
+  /** `### title`, `# @name`, or method + URL. */
+  label?: string;
+  /** Workspace grouping: `<org>/<project>/...` directories. */
+  org?: string;
+  project?: string;
+  /** The full spec request, for the runner. */
+  request?: HttpRequest;
+}
+
+/** `.http` is the format; `.rest` is the alias VS Code, httpyac, Visual Studio and kulala accept. */
+export const isRequestFile = (name: string): boolean => name.endsWith(".http") || name.endsWith(".rest");
+
+/** Every request in a file, each its own entry. */
+export function requestsInFile(source: string, id: string, path: string): RequestFile[] {
+  const file = parseHttpFile(source, path);
+  const parts = id.split("/");
+  const group = { org: parts.length >= 3 ? parts[0] : undefined, project: parts.length >= 3 ? parts[1] : undefined };
+  if (file.requests.length === 0) {
+    const error = file.errors[0] ? `line ${file.errors[0].line}: ${file.errors[0].message}` : file.runs.length ? undefined : "no request line";
+    if (file.runs.length) {
+      return file.runs.map((run, index) => ({
+        id: file.runs.length === 1 ? id : `${id}#${index + 1}`, path, file: id, index, siblings: file.runs.length,
+        method: "RUN", url: `${run.path}${run.name ? `#${run.name}` : ""}`, headers: {}, label: `run ${run.path}${run.name ? `#${run.name}` : ""}`, ...group,
+      }));
+    }
+    return [{ id, path, file: id, index: 0, siblings: 1, method: "GET", url: "", headers: {}, error, ...group }];
+  }
+  return file.requests.map((request, index) => {
+    const headers: Record<string, string> = {};
+    for (const h of request.headers) if ("name" in h) headers[h.name] = h.value;
+    const body = request.body.map((p) => p.kind === "text" ? p.text : `< ${p.path}`).join("\n");
+    const fileError = file.errors.find((e) => e.line > request.span.start && e.line <= request.span.end + 1);
+    return {
+      id: file.requests.length === 1 ? id : `${id}#${index + 1}`, path, file: id, index, siblings: file.requests.length,
+      method: request.method, url: request.url.split("\n")[0] ?? "", headers, body: body === "" ? undefined : body,
+      label: requestLabel(request), request, error: request.error ?? (fileError ? `line ${fileError.line}: ${fileError.message}` : undefined), ...group,
+    };
+  });
 }
 
 export const METHODS = new Set([
@@ -128,10 +174,10 @@ export function scanCollection(root: string, limits: ScanLimits = SCAN_LIMITS): 
           continue;
         }
         walk(full, depth + 1);
-      } else if (entry.isFile() && entry.name.endsWith(".http")) {
+      } else if (entry.isFile() && isRequestFile(entry.name)) {
         const id = relative(root, full).split(sep).join("/");
         try {
-          out.push(parseRequest(readFileSync(full, "utf8"), id, full));
+          out.push(...requestsInFile(readFileSync(full, "utf8"), id, full));
         } catch (error) {
           out.push({
             id, path: full, method: "GET", url: "", headers: {},
@@ -185,21 +231,23 @@ export async function scanCollectionAsync(
           continue;
         }
         await walk(full, depth + 1);
-      } else if (entry.isFile() && entry.name.endsWith(".http")) {
+      } else if (entry.isFile() && isRequestFile(entry.name)) {
         const id = relative(root, full).split(sep).join("/");
-        let request: RequestFile;
+        let requests: RequestFile[];
         try {
-          request = parseRequest(await readFile(full, { encoding: "utf8", signal: options.signal }), id, full);
+          requests = requestsInFile(await readFile(full, { encoding: "utf8", signal: options.signal }), id, full);
         } catch (error) {
           if (options.signal?.aborted) return;
-          request = {
-            id, path: full, method: "GET", url: "", headers: {},
+          requests = [{
+            id, path: full, file: id, method: "GET", url: "", headers: {},
             error: error instanceof Error ? error.message : String(error),
-          };
+          }];
         }
         if (options.signal?.aborted) return;
-        out.push(request);
-        options.onRequest?.(request);
+        for (const request of requests) {
+          out.push(request);
+          options.onRequest?.(request);
+        }
       }
     }
   };

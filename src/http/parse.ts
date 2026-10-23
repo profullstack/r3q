@@ -235,7 +235,11 @@ function parseBlock(lines: string[], start: number, end: number, title: string |
       break;
     }
     const req = requestLine(raw);
-    if (!req) { error(i, `not a request line: ${line.slice(0, 80)}`); return; }
+    if (!req) {
+      const word = /^([A-Za-z][\w-]*)\s+\S/.exec(line)?.[1];
+      error(i, word && word === word.toUpperCase() ? `unknown method ${JSON.stringify(word)}` : `not a request line: ${line.slice(0, 80)}`);
+      return;
+    }
     request = blank(file.requests.length, i, title, metadata, variables, preScripts);
     request.method = req.method;
     request.url = req.url;
