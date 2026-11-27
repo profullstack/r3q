@@ -196,7 +196,9 @@ test("collection create, inspect, audit and format", async () => {
   expect(rows[0]).toMatchObject({ name: "Check response", method: "GET", tags: ["smoke"] });
   expect((await auditCollection(root)).filter((f) => f.level === "error")).toEqual([]);
 
-  writeFileSync(join(root, "bad.http"), "GET {{base}}/x?k={{undefinedThing}}\nAuthorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789\n\n< ./missing.json\n");
+  // A fake token shaped like a GitHub one, built at runtime so secret scanners do not flag the fixture itself.
+  const fakeToken = ["gh", "p_", "x".repeat(36)].join("");
+  writeFileSync(join(root, "bad.http"), `GET {{base}}/x?k={{undefinedThing}}\nAuthorization: Bearer ${fakeToken}\n\n< ./missing.json\n`);
   const findings = await auditCollection(root);
   expect(findings.some((f) => f.message.includes("{{undefinedThing}}"))).toBe(true);
   expect(findings.some((f) => f.level === "error" && f.message.includes("GitHub token"))).toBe(true);
