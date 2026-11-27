@@ -1,0 +1,57 @@
+name: Setup r3q
+description: Install the r3q CLI (a REST client whose requests are .http files) and put it on PATH, checksum verified.
+author: Profullstack
+branding:
+  icon: send
+  color: purple
+inputs:
+  version:
+    description: r3q version to install (for example 0.3.0), or latest.
+    required: false
+    default: latest
+outputs:
+  version:
+    description: The r3q version that was installed.
+    value: ${{ steps.install.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Check for Node 22+
+      id: node
+      shell: bash
+      run: |
+        if command -v node >/dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 22 ]; then
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Set up Node
+      if: steps.node.outputs.ok != 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - name: Install r3q
+      id: install
+      shell: bash
+      env:
+        R3Q_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if ! [[ "$R3Q_VERSION" =~ ^(latest|v?[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?)$ ]]; then
+          echo "::error::version must be latest or a semver like 0.3.0 (got '$R3Q_VERSION')"; exit 1
+        fi
+        spec="@profullstack/r3q@${R3Q_VERSION#v}"
+        work="$(mktemp -d)"
+        # Download the exact tarball and check it against the registry's published integrity hash before installing it.
+        expected="$(npm view "$spec" dist.integrity)"
+        resolved="$(npm view "$spec" version)"
+        tarball="$(cd "$work" && npm pack "$spec" --silent | tail -n1)"
+        algo="${expected%%-*}"
+        actual="${algo}-$(openssl dgst "-${algo}" -binary "$work/$tarball" | openssl base64 -A)"
+        if [ "$actual" != "$expected" ]; then
+          echo "::error::checksum mismatch for $spec: expected $expected, got $actual"; exit 1
+        fi
+        echo "verified $spec ($resolved) $algo checksum"
+        npm install -g "$work/$tarball" --no-fund --no-audit
+        r3q version
+        echo "version=$resolved" >> "$GITHUB_OUTPUT"

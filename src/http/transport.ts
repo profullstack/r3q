@@ -31,6 +31,8 @@ export interface TransportOptions {
   signal?: AbortSignal;
   /** Called with each hop for `@debug`/`@verbose`. */
   log?: (line: string) => void;
+  /** A keep-alive agent for handshakes that must stay on one connection (NTLM). Used on direct connections only. */
+  agent?: http.Agent;
 }
 
 /** HTTP(S)_PROXY / NO_PROXY from the environment, the way curl reads them. */
@@ -202,7 +204,7 @@ async function once(req: PreparedRequest, opts: TransportOptions): Promise<Hop> 
   }
   return new Promise<Hop>((resolve, reject) => {
     const options: https.RequestOptions = {
-      method: req.method, host, port: reqPort, path, agent: false,
+      method: req.method, host, port: reqPort, path, agent: opts.agent && !proxy ? opts.agent : false,
       headers: headerObject,
       signal: opts.signal,
       ...(secure && !createConnection ? tlsFor(url, opts) : {}),
@@ -288,6 +290,7 @@ export async function transmit(input: PreparedRequest, opts: TransportOptions = 
   const has = (name: string): boolean => req.headers.some(([k]) => k.toLowerCase() === name);
   if (!has("accept-encoding")) req.headers.push(["Accept-Encoding", ACCEPT_ENCODING]);
   const redirects: string[] = [];
+  const hops: NonNullable<HttpResponse["hops"]> = [];
   const max = opts.maxRedirects ?? 20;
   for (;;) {
     const hopReq = { ...req, headers: [...req.headers] };
@@ -298,7 +301,9 @@ export async function transmit(input: PreparedRequest, opts: TransportOptions = 
       else hopReq.headers[userCookie] = ["Cookie", `${hopReq.headers[userCookie]![1]}; ${jar}`];
     }
     opts.log?.(`> ${hopReq.method} ${hopReq.url}`);
+    const hopStarted = performance.now();
     const hop = await once(hopReq, opts);
+    hops.push({ method: hopReq.method, url: hopReq.url, status: hop.status, statusText: hop.statusText, ms: Math.round(performance.now() - hopStarted) });
     opts.log?.(`< ${hop.status} ${hop.statusText}`);
     const setCookies = hop.headers.filter(([k]) => k.toLowerCase() === "set-cookie").map(([, v]) => v);
     if (setCookies.length) opts.cookies?.store(req.url, setCookies);
@@ -325,7 +330,7 @@ export async function transmit(input: PreparedRequest, opts: TransportOptions = 
     const contentType = hop.headers.find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "";
     return {
       status: hop.status, statusText: hop.statusText, httpVersion: hop.httpVersion, headers: hop.headers, body: hop.body,
-      text: decodeText(hop.body, contentType), contentType, duration: performance.now() - started, url: req.url, redirects,
+      text: decodeText(hop.body, contentType), contentType, duration: performance.now() - started, url: req.url, redirects, hops,
     };
   }
 }
