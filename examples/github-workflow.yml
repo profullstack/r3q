@@ -1,0 +1,31 @@
+# Copy to .github/workflows/api-smoke.yml in the repository that holds your collection.
+name: API smoke tests
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: profullstack/r3q@v0.3.0
+        with:
+          version: 0.3.0
+
+      - name: Run the smoke-tagged requests
+        env:
+          # {{API_TOKEN}} in a request falls back to the process environment.
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: r3q run ./api --tag smoke --env ci --reporter junit --output results.xml
+
+      - name: Keep the report, even when a check failed
+        if: always() && hashFiles('results.xml') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: r3q-results
+          path: results.xml
+          retention-days: 1

@@ -107,6 +107,26 @@ export class CookieJar {
 
   clear(): void { this.cookies = []; this.save(); }
 
+  /** Remove cookies for a domain (and its subdomains), optionally only one name. Returns how many went. */
+  remove(domain: string, name?: string): number {
+    const d = domain.replace(/^\./, "").toLowerCase();
+    const before = this.cookies.length;
+    this.cookies = this.cookies.filter((c) => !((c.domain === d || c.domain.endsWith(`.${d}`)) && (name === undefined || c.name === name)));
+    this.save();
+    return before - this.cookies.length;
+  }
+
+  /** Add or replace one cookie by hand (r3q cookies set). */
+  set(input: { name: string; value: string; domain: string; path?: string; expires?: number; secure?: boolean; httpOnly?: boolean }): void {
+    const cookie: Cookie = {
+      name: input.name, value: input.value, domain: input.domain.replace(/^\./, "").toLowerCase(), hostOnly: !input.domain.startsWith("."),
+      path: input.path ?? "/", expires: input.expires, secure: input.secure ?? false, httpOnly: input.httpOnly ?? false, created: Date.now(),
+    };
+    this.cookies = this.cookies.filter((c) => !(c.name === cookie.name && c.domain === cookie.domain && c.path === cookie.path));
+    this.cookies.push(cookie);
+    this.save();
+  }
+
   private save(): void {
     if (!this.file) return;
     try {

@@ -12,15 +12,17 @@ import { applyAuth, tokenVariable, type AuthContext } from "./auth.ts";
 import { curlToHttp } from "./convert.ts";
 import { CookieJar } from "./cookies.ts";
 import { loadEnvironment, tlsFor, type Environment } from "./env.ts";
+import { folderDefaults } from "./folder.ts";
+import { loadSecrets, setSecret } from "./secrets.ts";
 import { addMetadata, parseHttpFile } from "./parse.ts";
 import { runStream, streamKind } from "./protocols.ts";
-import { jsonPathFirst, stringify } from "./query.ts";
+import { jsonPath, jsonPathFirst, stringify, xpathText } from "./query.ts";
 import { runAssertions, runScript, type ScriptRun, type TestResult } from "./scripts.ts";
 import { transmit, type TransportOptions } from "./transport.ts";
 import type { HttpFile, HttpRequest, HttpResponse, Interaction, Metadata, PreparedRequest, RunDirective, Script } from "./types.ts";
 import { Resolver, parseBody, type Exchanged, type Scope } from "./variables.ts";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 export interface RunResult {
   file: string;
@@ -51,6 +53,10 @@ export interface SessionOptions {
   openUrl?(url: string): void;
   /** Live streaming messages and log lines, for the UI. */
   onEvent?(event: { kind: "log" | "message"; text: string }): void;
+  /** Read secrets from the OS credential store (default true; tests turn it off). */
+  secrets?: boolean;
+  /** Called after every request that ran (including dependencies and r3q.send), for the timeline. */
+  onResult?(result: RunResult): void;
 }
 
 const UNIT_MS: Record<string, number> = { ms: 1, s: 1000, m: 60_000 };
@@ -101,11 +107,19 @@ export class Session {
   private readonly rate = new Map<string, number[]>();
   private readonly running = new Set<string>();
   private controller = new AbortController();
+  private secretValues?: Record<string, string>;
 
   constructor(options: SessionOptions) {
     this.options = options;
     this.environments = options.environments ?? [];
     this.cookies = new CookieJar(options.cookieFile);
+  }
+
+  /** Secrets from the OS credential store, read once per session. */
+  secrets(): Record<string, string> {
+    if (this.options.secrets === false) return {};
+    this.secretValues ??= loadSecrets(this.options.root);
+    return this.secretValues;
   }
 
   /** Stop whatever is running (streams, polling, sleeps). */
@@ -173,7 +187,14 @@ export class Session {
 
   /** Run one request, with its dependencies, loops and scripts. */
   async run(file: HttpFile, request: HttpRequest, opts: { overrides?: Record<string, string>; batch?: boolean } = {}): Promise<RunResult> {
-    const metadata: Metadata = new Map(file.metadata);
+    const result = await this.runOne(file, request, opts);
+    this.options.onResult?.(result);
+    return result;
+  }
+
+  private async runOne(file: HttpFile, request: HttpRequest, opts: { overrides?: Record<string, string>; batch?: boolean }): Promise<RunResult> {
+    const metadata: Metadata = new Map(folderDefaults(this.options.root, dirname(file.path)).metadata);
+    for (const [k, v] of file.metadata) metadata.set(k, [...v]);
     for (const [k, v] of request.metadata) metadata.set(k, [...(metadata.get(k) ?? []), ...v]);
     const result: RunResult = { file: file.path, request, tests: [], logs: [] };
     if (request.error) { result.error = request.error; return result; }
@@ -230,10 +251,12 @@ export class Session {
     const before = file.variables.filter((v) => v.line <= request.line);
     const after = file.variables.filter((v) => v.line > request.line && !before.some((b) => b.name === v.name));
     const imported = related.slice(1).flatMap((f) => f.variables);
+    const folder = folderDefaults(this.options.root, baseDir);
     const scope: Scope = {
       root: this.options.root, baseDir, request: requestVars,
       file: [...imported, ...after, ...before, ...request.variables],
-      globals: this.globals, env: env.variables, dotenv: env.dotenv, responses: this.responses,
+      // Folder variables are defaults: an environment, a secret or the file itself overrides them.
+      globals: this.globals, env: { ...Object.fromEntries(folder.variables.map((v) => [v.name, v.value])), ...this.secrets(), ...env.variables }, dotenv: env.dotenv, responses: this.responses,
       interaction: this.options.interaction, cache: this.cache, named,
       ensure: async (name, force) => {
         if (this.running.has(name)) return;
@@ -330,9 +353,11 @@ export class Session {
       raw: { method: request.method, url: request.url, body: request.body.map((p) => p.kind === "text" ? p.text : `< ${p.path}`).join("\n"), headers: request.headers.flatMap((h) => "name" in h ? [[h.name, h.value] as [string, string]] : []) },
       cookies: (n) => this.cookies.byName(n), substitute: sub,
       log: (line) => this.log(result, line),
+      runRequest: (spec, vars) => this.sendFromScript(file, spec, vars),
     };
-    const globalBefore = file.globalScripts.filter((s) => !s.event || s.event === "request");
-    const globalAfter = file.globalScripts.filter((s) => s.event === "response" || s.event === "after" || s.event === "responseLogging");
+    const folder = folderDefaults(this.options.root, baseDir);
+    const globalBefore = [...folder.preScripts, ...file.globalScripts.filter((s) => !s.event || s.event === "request")];
+    const globalAfter = [...file.globalScripts.filter((s) => s.event === "response" || s.event === "after" || s.event === "responseLogging"), ...folder.postScripts];
     for (const script of [...globalBefore, ...request.preScripts.filter((s) => s.event !== "streaming")]) {
       const outcome = await runScript(script, scriptRun);
       result.tests.push(...outcome.tests);
@@ -384,6 +409,19 @@ export class Session {
       const [key, header] = spec.trim().split(/\s+/);
       const value = response.headers.find(([k]) => k.toLowerCase() === (header ?? key ?? "").toLowerCase())?.[1];
       if (key && value !== undefined) this.globals.set(key, value);
+    }
+
+    // r3q captures: `@capture name = expr` for later requests, `-env` into the private env file, `-secret` into the OS store.
+    for (const kind of ["capture", "capture-env", "capture-secret"] as const) {
+      for (const spec of metadata.get(kind) ?? []) {
+        const m = /^([\w.-]+)\s*=\s*(.+)$/.exec(spec.trim());
+        if (!m) { this.log(result, `@${kind}: expected "name = expression", got "${spec}"`); continue; }
+        const value = captureValue(response, m[2]!.trim());
+        if (value === undefined) { this.log(result, `@${kind} ${m[1]}: ${m[2]} matched nothing`); continue; }
+        this.globals.set(m[1]!, value);
+        if (kind === "capture-env") { this.log(result, `captured ${m[1]} into ${await writePrivateEnv(this.options.root, this.environments[0], m[1]!, value)}`); this.envs.clear(); }
+        else if (kind === "capture-secret") { this.secrets()[m[1]!] = value; this.log(result, `captured ${m[1]} into ${setSecret(this.options.root, m[1]!, value)}`); }
+      }
     }
 
     // @jwt: decode JWT properties so scripts and the UI can read the claims.
@@ -484,6 +522,7 @@ export class Session {
       headers.push([await sub(h.name), await sub(h.value)]);
     }
     const has = (n: string): boolean => headers.some(([k]) => k.toLowerCase() === n);
+    for (const [k, v] of folderDefaults(this.options.root, baseDir).headers) if (!has(k.toLowerCase())) headers.push([k, await sub(v)]);
     for (const [k, v] of this.globalHeaders) if (!has(k.toLowerCase())) headers.push([k, await sub(v)]);
     for (const [k, v] of Object.entries(env.defaultHeaders ?? {})) if (!has(k.toLowerCase())) headers.push([k, await sub(v)]);
     if (!has("user-agent")) headers.push(["User-Agent", `r3q/${VERSION}`]);
@@ -593,6 +632,7 @@ export class Session {
       opts.tls = () => material;
     }
     const auth = await applyAuth(prepared, this.authContext(scope));
+    if (auth.agent) opts.agent = auth.agent;
     let response = await transmit(auth.request, opts);
     if (response.status === 401 && auth.onChallenge) {
       const retry = await auth.onChallenge(response);
@@ -636,6 +676,21 @@ export class Session {
     result.messages = messages;
     const text = messages.join("\n");
     return { status: messages.some((m) => m.startsWith("error:")) ? 0 : 101, statusText: "WebSocket", httpVersion: "HTTP/1.1", headers: [], body: Buffer.from(text), text, contentType: "application/json", duration: performance.now() - started, url: prepared.url, redirects: [] };
+  }
+
+  /** `r3q.send("other.http#name", { var: "x" })` from a script: run a saved request and hand back its response. */
+  private async sendFromScript(from: HttpFile, spec: string, vars?: Record<string, string>): Promise<{ status: number; headers: Record<string, string>; body: unknown; text: string }> {
+    const hash = spec.lastIndexOf("#");
+    const pathPart = hash >= 0 ? spec.slice(0, hash) : spec;
+    const which = hash >= 0 ? spec.slice(hash + 1) : undefined;
+    const file = pathPart ? await this.load(resolve(dirname(from.path), pathPart)) : from;
+    const request = which ? file.requests.find((r, i) => r.name === which || r.title === which || String(i + 1) === which) : file.requests[0];
+    if (!request) throw new Error(`r3q.send: no request "${spec}"`);
+    const result = await this.run(file, request, { overrides: vars });
+    if (result.error) throw new Error(`r3q.send ${spec}: ${result.error}`);
+    const res = result.response;
+    if (!res) throw new Error(`r3q.send ${spec}: no response (${result.skipped ?? "not sent"})`);
+    return { status: res.status, headers: Object.fromEntries(res.headers.map(([k, v]) => [k.toLowerCase(), v])), body: parseBody(res), text: res.text };
   }
 
   /** `>>` picks a free name (`file-1.json`); `>>!` overwrites. */
@@ -699,6 +754,37 @@ export function runJq(expression: string, text: string): string | undefined {
     } catch { return undefined; }
   }
   return undefined;
+}
+
+/**
+ * What a capture reads from a response: `status`, `header Name`, `body` (all of it),
+ * `body.$.path` / `$.path` (JSONPath), `xpath //node`, or `body.a.b` (dot path).
+ */
+export function captureValue(response: HttpResponse, expr: string): string | undefined {
+  const e = expr.trim();
+  if (e === "status") return String(response.status);
+  if (e === "body") return response.text;
+  const header = /^headers?\s*[.\s]\s*(.+)$/i.exec(e);
+  if (header) return response.headers.find(([k]) => k.toLowerCase() === header[1]!.trim().toLowerCase())?.[1];
+  const xp = /^(?:body\.)?xpath\s+(.+)$/i.exec(e) ?? (e.startsWith("//") || e.startsWith("/") ? [e, e] : undefined);
+  if (xp) return xpathText(response.text, xp[1]!);
+  let path = e.replace(/^body\.?/, "");
+  if (!path.startsWith("$")) path = `$.${path}`;
+  try {
+    const found = jsonPath(JSON.parse(response.text), path)[0];
+    return found === undefined ? undefined : stringify(found);
+  } catch { return undefined; }
+}
+
+/** Put one value into `http-client.private.env.json` (under the environment, or `$shared`), creating it if needed. */
+export async function writePrivateEnv(root: string, environment: string | undefined, name: string, value: string): Promise<string> {
+  const path = join(root, "http-client.private.env.json");
+  let data: Record<string, Record<string, unknown>> = {};
+  try { data = JSON.parse(await readFile(path, "utf8")) as typeof data; } catch { /* new file */ }
+  const env = environment ?? "$shared";
+  data[env] = { ...(data[env] ?? {}), [name]: value };
+  await writeFile(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  return `${path} (${env})`;
 }
 
 export type { Script };

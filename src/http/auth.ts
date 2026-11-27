@@ -7,12 +7,15 @@
  *   Authorization: AWS key secret [token:..] [region:..] [service:..]   SigV4
  *   Authorization: COGNITO user pass region poolId clientId            SRP login
  *   Authorization: openid <flow> <prefix>     httpyac OAuth2 / OpenID Connect
+ *   Authorization: OAuth1 key secret [token tokenSecret] [method:..] [realm:..]   RFC 5849
+ *   Authorization: NTLM user password [domain]   NTLMv2 handshake on one connection
  *
  * plus the VS Code token variables {{$aadToken}}, {{$aadV2Token}} and
  * {{$oidcAccessToken}}. Anything else (Bearer, a literal token) is left alone.
  */
 import { createHash, createHmac, getDiffieHellman, randomBytes } from "node:crypto";
-import { createServer, type Server } from "node:http";
+import http, { createServer, type Server } from "node:http";
+import https from "node:https";
 import type { HttpResponse, Interaction, PreparedRequest } from "./types.ts";
 
 export interface AuthContext {
@@ -26,7 +29,12 @@ export interface AuthContext {
   openUrl?(url: string): void;
 }
 
-type AuthResult = { request: PreparedRequest; onChallenge?: (res: HttpResponse) => Promise<PreparedRequest | undefined> };
+type AuthResult = {
+  request: PreparedRequest;
+  onChallenge?: (res: HttpResponse) => Promise<PreparedRequest | undefined>;
+  /** Send the request and its challenge retry over this keep-alive agent (NTLM is per connection). */
+  agent?: http.Agent;
+};
 
 // ── header helpers ──────────────────────────────────────────────────────────
 
@@ -75,6 +83,8 @@ export async function applyAuth(req: PreparedRequest, ctx: AuthContext): Promise
       const token = await oauth2Token(flow, prefix, ctx);
       return { request: withHeader(req, "Authorization", `Bearer ${token}`) };
     }
+    case "oauth1": return { request: withHeader(req, "Authorization", oauth1Header(req, rest)) };
+    case "ntlm": return ntlm(req, rest);
     default: return { request: req };
   }
 }
@@ -755,4 +765,213 @@ export async function tokenVariable(name: "$aadToken" | "$aadV2Token" | "$oidcAc
   const key = `oidc:${config.authorizationEndpoint}:${config.clientId}:${config.scope}`;
   const token = await cachedToken(key, ctx, config, () => authorizationCode(ctx, config), force);
   return `Bearer ${token.access_token}`;
+}
+
+// ── OAuth 1.0a (RFC 5849) ───────────────────────────────────────────────────
+
+const OAUTH1_HASH: Record<string, string> = { "HMAC-SHA1": "sha1", "HMAC-SHA256": "sha256", "HMAC-SHA512": "sha512" };
+
+/**
+ * `OAuth1 consumerKey consumerSecret [token tokenSecret]` with optional
+ * `method:` `realm:` `callback:` `verifier:` `nonce:` `timestamp:` `body:false`.
+ * Form bodies are signed (RFC 5849 3.4.1.3) unless `body:false`.
+ */
+export function oauth1Header(req: PreparedRequest, spec: string, now: Date = new Date()): string {
+  const { positional, named } = options(words(spec));
+  const [consumerKey, consumerSecret = "", token, tokenSecret = ""] = positional;
+  if (!consumerKey) throw new Error("OAuth1: expected `OAuth1 consumerKey consumerSecret [token tokenSecret]`");
+  const method = (named.method ?? "HMAC-SHA1").toUpperCase();
+  if (method !== "PLAINTEXT" && !OAUTH1_HASH[method]) throw new Error(`OAuth1: unsupported signature method ${method} (HMAC-SHA1, HMAC-SHA256, HMAC-SHA512, PLAINTEXT)`);
+  const oauth: [string, string][] = [
+    ["oauth_consumer_key", consumerKey],
+    ["oauth_nonce", named.nonce ?? randomBytes(16).toString("hex")],
+    ["oauth_signature_method", method],
+    ["oauth_timestamp", named.timestamp ?? String(Math.floor(now.getTime() / 1000))],
+    ["oauth_version", "1.0"],
+  ];
+  if (token) oauth.push(["oauth_token", token]);
+  if (named.callback) oauth.push(["oauth_callback", named.callback]);
+  if (named.verifier) oauth.push(["oauth_verifier", named.verifier]);
+
+  const key = `${rfc3986(consumerSecret)}&${rfc3986(tokenSecret)}`;
+  let signature: string;
+  if (method === "PLAINTEXT") signature = key;
+  else {
+    const url = new URL(req.url);
+    const params: [string, string][] = [...oauth];
+    for (const [k, v] of url.searchParams) params.push([k, v]);
+    const contentType = getHeader(req.headers, "Content-Type") ?? "";
+    if (named.body !== "false" && req.body && /application\/x-www-form-urlencoded/i.test(contentType)) {
+      for (const [k, v] of new URLSearchParams(req.body.toString("utf8"))) params.push([k, v]);
+    }
+    const normalized = params
+      .map(([k, v]) => [rfc3986(k), rfc3986(v)] as const)
+      .sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)
+      .map(([k, v]) => `${k}=${v}`).join("&");
+    const scheme = url.protocol.toLowerCase();
+    const base = `${scheme}//${url.hostname.toLowerCase()}${url.port ? `:${url.port}` : ""}${url.pathname}`;
+    const baseString = `${req.method.toUpperCase()}&${rfc3986(base)}&${rfc3986(normalized)}`;
+    signature = createHmac(OAUTH1_HASH[method]!, key).update(baseString).digest("base64");
+  }
+  oauth.push(["oauth_signature", signature]);
+  const fields = oauth.map(([k, v]) => `${k}="${rfc3986(v)}"`);
+  if (named.realm !== undefined) fields.unshift(`realm="${named.realm.replace(/"/g, '\\"')}"`);
+  return `OAuth ${fields.join(", ")}`;
+}
+
+// ── NTLMv2 (MS-NLMP) ────────────────────────────────────────────────────────
+
+/** MD4 (RFC 1320), in JavaScript because OpenSSL 3 moved it to the legacy provider. */
+export function md4(input: Buffer | string): Buffer {
+  const msg = typeof input === "string" ? Buffer.from(input, "utf8") : input;
+  const padLen = ((msg.length + 8) >> 6 << 6) + 64 - msg.length;
+  const data = Buffer.alloc(msg.length + padLen);
+  msg.copy(data);
+  data[msg.length] = 0x80;
+  data.writeBigUInt64LE(BigInt(msg.length) * 8n, data.length - 8);
+  let a = 0x67452301, b = 0xefcdab89 | 0, c = 0x98badcfe | 0, d = 0x10325476;
+  const rotl = (x: number, n: number): number => (x << n) | (x >>> (32 - n));
+  const F = (p: number, q: number, r: number): number => (p & q) | (~p & r);
+  const G = (p: number, q: number, r: number): number => (p & q) | (p & r) | (q & r);
+  const H = (p: number, q: number, r: number): number => p ^ q ^ r;
+  const x = new Array<number>(16);
+  for (let off = 0; off < data.length; off += 64) {
+    for (let i = 0; i < 16; i++) x[i] = data.readInt32LE(off + i * 4);
+    const aa = a, bb = b, cc = c, dd = d;
+    for (const k of [0, 4, 8, 12]) {
+      a = rotl((a + F(b, c, d) + x[k]!) | 0, 3);
+      d = rotl((d + F(a, b, c) + x[k + 1]!) | 0, 7);
+      c = rotl((c + F(d, a, b) + x[k + 2]!) | 0, 11);
+      b = rotl((b + F(c, d, a) + x[k + 3]!) | 0, 19);
+    }
+    for (const k of [0, 1, 2, 3]) {
+      a = rotl((a + G(b, c, d) + x[k]! + 0x5a827999) | 0, 3);
+      d = rotl((d + G(a, b, c) + x[k + 4]! + 0x5a827999) | 0, 5);
+      c = rotl((c + G(d, a, b) + x[k + 8]! + 0x5a827999) | 0, 9);
+      b = rotl((b + G(c, d, a) + x[k + 12]! + 0x5a827999) | 0, 13);
+    }
+    for (const k of [0, 2, 1, 3]) {
+      a = rotl((a + H(b, c, d) + x[k]! + 0x6ed9eba1) | 0, 3);
+      d = rotl((d + H(a, b, c) + x[k + 8]! + 0x6ed9eba1) | 0, 9);
+      c = rotl((c + H(d, a, b) + x[k + 4]! + 0x6ed9eba1) | 0, 11);
+      b = rotl((b + H(c, d, a) + x[k + 12]! + 0x6ed9eba1) | 0, 15);
+    }
+    a = (a + aa) | 0; b = (b + bb) | 0; c = (c + cc) | 0; d = (d + dd) | 0;
+  }
+  const out = Buffer.alloc(16);
+  out.writeInt32LE(a, 0); out.writeInt32LE(b, 4); out.writeInt32LE(c, 8); out.writeInt32LE(d, 12);
+  return out;
+}
+
+const NTLM_SIGNATURE = Buffer.from("NTLMSSP\0", "latin1");
+const NTLM_FLAGS = (0x00000001 /* unicode */ | 0x00000004 /* request target */ | 0x00000200 /* NTLM */
+  | 0x00008000 /* always sign */ | 0x00080000 /* extended session security */ | 0x00800000 /* target info */
+  | 0x20000000 /* 128-bit */ | 0x80000000 /* 56-bit */) >>> 0;
+const utf16 = (s: string): Buffer => Buffer.from(s, "utf16le");
+const hmacMd5 = (key: Buffer, ...data: Buffer[]): Buffer => { const h = createHmac("md5", key); for (const d of data) h.update(d); return h.digest(); };
+
+/** Type 1 (negotiate), base64. */
+export function ntlmType1(): string {
+  const msg = Buffer.alloc(32);
+  NTLM_SIGNATURE.copy(msg, 0);
+  msg.writeUInt32LE(1, 8);
+  msg.writeUInt32LE(NTLM_FLAGS, 12);
+  msg.writeUInt32LE(32, 20); // empty domain, offset past the header
+  msg.writeUInt32LE(32, 28); // empty workstation
+  return msg.toString("base64");
+}
+
+export interface NtlmChallenge { flags: number; challenge: Buffer; targetName: string; targetInfo: Buffer; timestamp?: Buffer }
+
+/** Type 2 (challenge), from a `WWW-Authenticate: NTLM <base64>` value or the bare base64. */
+export function parseType2(value: string): NtlmChallenge {
+  const msg = Buffer.from(value.trim().replace(/^NTLM\s+/i, ""), "base64");
+  if (msg.length < 32 || !msg.subarray(0, 8).equals(NTLM_SIGNATURE) || msg.readUInt32LE(8) !== 2) throw new Error("NTLM: the server's challenge is not an NTLM type 2 message");
+  const field = (at: number): Buffer => {
+    if (msg.length < at + 8) return Buffer.alloc(0);
+    const len = msg.readUInt16LE(at), off = msg.readUInt32LE(at + 4);
+    return Buffer.from(msg.subarray(off, off + len));
+  };
+  const flags = msg.readUInt32LE(20);
+  const targetInfo = field(40);
+  let timestamp: Buffer | undefined;
+  for (let i = 0; i + 4 <= targetInfo.length;) {
+    const id = targetInfo.readUInt16LE(i), len = targetInfo.readUInt16LE(i + 2);
+    if (id === 0) break;
+    if (id === 7) timestamp = Buffer.from(targetInfo.subarray(i + 4, i + 4 + len));
+    i += 4 + len;
+  }
+  const name = field(12);
+  return { flags, challenge: Buffer.from(msg.subarray(24, 32)), targetName: flags & 1 ? name.toString("utf16le") : name.toString("latin1"), targetInfo, timestamp };
+}
+
+/** NTOWFv2: HMAC-MD5(MD4(UTF-16LE password), UTF-16LE(UPPER(user) + domain)). */
+export function ntowfv2(user: string, password: string, domain: string): Buffer {
+  return hmacMd5(md4(utf16(password)), utf16(user.toUpperCase() + domain));
+}
+
+/** The NTLMv2 and LMv2 responses to a server challenge. */
+export function ntlmv2Response(input: { user: string; password: string; domain: string; serverChallenge: Buffer; clientChallenge: Buffer; timestamp: Buffer; targetInfo: Buffer }): { nt: Buffer; lm: Buffer; ntProof: Buffer } {
+  const key = ntowfv2(input.user, input.password, input.domain);
+  const temp = Buffer.concat([
+    Buffer.from([1, 1, 0, 0, 0, 0, 0, 0]), input.timestamp, input.clientChallenge,
+    Buffer.alloc(4), input.targetInfo, Buffer.alloc(4),
+  ]);
+  const ntProof = hmacMd5(key, input.serverChallenge, temp);
+  const lm = Buffer.concat([hmacMd5(key, input.serverChallenge, input.clientChallenge), input.clientChallenge]);
+  return { nt: Buffer.concat([ntProof, temp]), lm, ntProof };
+}
+
+/** Windows FILETIME (100 ns ticks since 1601), 8 bytes little-endian. */
+function filetime(now: Date): Buffer {
+  const out = Buffer.alloc(8);
+  out.writeBigUInt64LE((BigInt(now.getTime()) + 11644473600000n) * 10000n);
+  return out;
+}
+
+/** Type 3 (authenticate), base64. */
+export function ntlmType3(challenge: NtlmChallenge, creds: { user: string; password: string; domain: string; workstation?: string }, opts: { clientChallenge?: Buffer; now?: Date } = {}): string {
+  const clientChallenge = opts.clientChallenge ?? randomBytes(8);
+  const timestamp = challenge.timestamp ?? filetime(opts.now ?? new Date());
+  const { nt, lm } = ntlmv2Response({ ...creds, serverChallenge: challenge.challenge, clientChallenge, timestamp, targetInfo: challenge.targetInfo });
+  // When the server sends a timestamp, MS-NLMP 3.1.5.1.2 sends a zero LMv2 response.
+  const lmResponse = challenge.timestamp ? Buffer.alloc(24) : lm;
+  const fields = [lmResponse, nt, utf16(creds.domain), utf16(creds.user), utf16(creds.workstation ?? ""), Buffer.alloc(0)];
+  const header = Buffer.alloc(64);
+  NTLM_SIGNATURE.copy(header, 0);
+  header.writeUInt32LE(3, 8);
+  let offset = 64;
+  fields.forEach((f, i) => {
+    const at = 12 + i * 8;
+    header.writeUInt16LE(f.length, at);
+    header.writeUInt16LE(f.length, at + 2);
+    header.writeUInt32LE(offset, at + 4);
+    offset += f.length;
+  });
+  header.writeUInt32LE(((NTLM_FLAGS & challenge.flags) | 0x00000201) >>> 0, 60);
+  return Buffer.concat([header, ...fields]).toString("base64");
+}
+
+/** `user password [domain]` or `DOMAIN\user password`. */
+export function ntlmCredentials(rest: string): { user: string; password: string; domain: string } {
+  const [who = "", password = "", domainArg] = words(rest);
+  if (!who) throw new Error("NTLM: expected `NTLM user password [domain]`");
+  const slash = who.indexOf("\\");
+  if (slash > 0) return { user: who.slice(slash + 1), password, domain: domainArg ?? who.slice(0, slash) };
+  return { user: who, password, domain: domainArg ?? "" };
+}
+
+function ntlm(req: PreparedRequest, rest: string): AuthResult {
+  const creds = ntlmCredentials(rest);
+  // NTLM authenticates the connection, so the negotiate and the authenticate must share one socket.
+  const agent = new URL(req.url).protocol === "https:" ? new https.Agent({ keepAlive: true, maxSockets: 1 }) : new http.Agent({ keepAlive: true, maxSockets: 1 });
+  return {
+    agent,
+    request: withHeader(req, "Authorization", `NTLM ${ntlmType1()}`),
+    onChallenge: async (res) => {
+      const offer = res.headers.filter(([k]) => k.toLowerCase() === "www-authenticate").map(([, v]) => v.trim()).find((v) => /^NTLM\s+\S/i.test(v));
+      if (!offer) return undefined;
+      return withHeader(req, "Authorization", `NTLM ${ntlmType3(parseType2(offer), creds)}`);
+    },
+  };
 }

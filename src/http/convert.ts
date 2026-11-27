@@ -7,7 +7,7 @@
  * file system; the caller decides where the converted files go.
  */
 import { isUtf8 } from "node:buffer";
-import type { PreparedRequest } from "./types.ts";
+import type { HttpFile, HttpRequest, PreparedRequest } from "./types.ts";
 
 // ---------------------------------------------------------------- curl in
 
@@ -830,7 +830,7 @@ function scriptCode(events: Json, listen: string): string {
   return "";
 }
 
-function postmanRequest(item: Json, inheritedAuth: Json, used: Set<string>): string {
+function postmanRequest(item: Json, inheritedAuth: Json, used: Set<string>, warnings?: string[]): string {
   const request = typeof item.request === "string" ? { url: item.request, method: "GET" } : (item.request ?? {});
   const title = str(item.name) || "request";
   const lines: string[] = [`### ${title}`, `# @name ${uniqueName(slug(title), used)}`];
@@ -848,6 +848,7 @@ function postmanRequest(item: Json, inheritedAuth: Json, used: Set<string>): str
   lines.push(...notes);
   for (const [k, v] of url.vars) lines.push(`@${k} = ${v}`);
   const pre = scriptCode(item.event, "prerequest");
+  if (pre || scriptCode(item.event, "test")) warnings?.push(`${title}: Postman script kept verbatim; port pm.* calls`);
   if (pre) lines.push(scriptBlock("<", pre, "Converted from Postman: pm.* calls are kept verbatim; port them to request.* / client.*"));
   lines.push(`${str(request.method || "GET").toUpperCase()} ${url.url}`);
   for (const [k, v] of headers) lines.push(`${k}: ${v}`);
@@ -863,7 +864,7 @@ function postmanRequest(item: Json, inheritedAuth: Json, used: Set<string>): str
  * subfolders under a `<folder>/` directory. Collection variables are written
  * at the top of every file so each one runs on its own.
  */
-export function importPostman(collection: unknown): Map<string, string> {
+export function importPostman(collection: unknown, warnings?: string[]): Map<string, string> {
   const doc = (typeof collection === "string" ? JSON.parse(collection) : collection) as Json;
   if (!doc || typeof doc !== "object" || !Array.isArray(doc.item)) throw new Error("not a Postman collection: no item array");
   const files = new Map<string, string>();
@@ -886,7 +887,7 @@ export function importPostman(collection: unknown): Map<string, string> {
       const folderAuth = folder.auth && folder.auth.type !== "inherit" ? folder.auth : auth;
       const requests = folder.item.filter((x: Json) => !Array.isArray(x?.item));
       const usedNames = new Set<string>();
-      write(`${dir}${name}.http`, requests.map((item: Json) => postmanRequest(item, folderAuth, usedNames)));
+      write(`${dir}${name}.http`, requests.map((item: Json) => postmanRequest(item, folderAuth, usedNames, warnings)));
       const nested = folder.item.filter((x: Json) => Array.isArray(x?.item));
       if (nested.length) walkNested(nested, `${dir}${name}/`, folderAuth);
     }
@@ -897,7 +898,7 @@ export function importPostman(collection: unknown): Map<string, string> {
   // Top-level requests share one file; folders are written by walkNested.
   const topRequests = doc.item.filter((x: Json) => !Array.isArray(x?.item));
   const used = new Set<string>();
-  write(`${rootName}.http`, topRequests.map((item: Json) => postmanRequest(item, rootAuth, used)));
+  write(`${rootName}.http`, topRequests.map((item: Json) => postmanRequest(item, rootAuth, used, warnings)));
   walkNested(doc.item.filter((x: Json) => Array.isArray(x?.item)), "", rootAuth);
   return files;
 }
@@ -1235,7 +1236,8 @@ function mediaExample(doc: Json, media: Json): unknown {
 
 function paramValue(doc: Json, param: Json): string | undefined {
   const schema = resolveRef(doc, param.schema ?? param);
-  const v = param.example ?? (param.examples ? resolveRef(doc, Object.values(param.examples)[0])?.value : undefined) ?? schema?.example ?? schema?.default;
+  const examples = param.examples && !Array.isArray(param.examples) ? resolveRef(doc, Object.values(param.examples)[0])?.value : undefined;
+  const v = param.example ?? examples ?? param["x-example"] ?? schema?.example ?? (Array.isArray(schema?.examples) ? schema.examples[0] : undefined) ?? schema?.default;
   return v === undefined ? undefined : typeof v === "string" ? v : JSON.stringify(v);
 }
 
@@ -1398,6 +1400,508 @@ export function importOpenApi(spec: unknown | string): Map<string, string> {
     files.set(file, `${baseUrl ? `@baseUrl = ${baseUrl}\n\n` : ""}${blocks.join("\n\n")}\n`);
   }
   return files;
+}
+
+// ---------------------------------------------------------------- Insomnia
+
+/** Insomnia template tags: `{{ _.name }}` → `{{name}}`; the common `{% %}` functions → dynamic variables. */
+function insomniaTemplate(text: unknown, warnings?: string[], where = ""): string {
+  let s = str(text).replace(/\{\{\s*(?:_\.)?([\w.$-]+)\s*\}\}/g, "{{$1}}");
+  s = s.replace(/\{%\s*(\w+)([^%]*)%\}/g, (whole, fn: string, args: string) => {
+    if (fn === "uuid") return "{{$uuid}}";
+    if (fn === "now" || fn === "timestamp") {
+      if (/unix|millis/.test(args) || fn === "timestamp") return "{{$timestamp}}";
+      return "{{$isoTimestamp}}";
+    }
+    warnings?.push(`${where}: Insomnia tag ${whole.trim()} was not converted`);
+    return whole;
+  });
+  return s;
+}
+
+interface InsomniaNode {
+  name: string;
+  folder: boolean;
+  children: InsomniaNode[];
+  request?: Json;
+  auth?: Json;
+  headers: [string, string][];
+  variables: [string, string][];
+  sort: number;
+}
+
+function insomniaPairs(list: Json, warnings: string[] | undefined, where: string): [string, string][] {
+  return (Array.isArray(list) ? list : [])
+    .filter((h: Json) => h && !h.disabled && str(h.name) !== "")
+    .map((h: Json) => [insomniaTemplate(h.name, warnings, where), insomniaTemplate(h.value, warnings, where)] as [string, string]);
+}
+
+function flatten(data: Json, prefix = "", out: Record<string, string> = {}): Record<string, string> {
+  for (const [k, v] of Object.entries(data ?? {})) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === "object" && !Array.isArray(v)) flatten(v, key, out);
+    else out[key] = insomniaTemplate(v);
+  }
+  return out;
+}
+
+function insomniaAuth(auth: Json, headers: [string, string][], url: { url: string }, warnings: string[] | undefined, where: string): string[] {
+  const notes: string[] = [];
+  if (!auth || typeof auth !== "object" || auth.disabled || !auth.type || auth.type === "none" || auth.type === "inherit") return notes;
+  const t = (v: unknown) => insomniaTemplate(v, warnings, where);
+  switch (auth.type) {
+    case "basic": headers.push(["Authorization", `Basic ${t(auth.username)} ${t(auth.password)}`]); break;
+    case "bearer": headers.push(["Authorization", `${t(auth.prefix) || "Bearer"} ${t(auth.token)}`]); break;
+    case "digest": headers.push(["Authorization", `Digest ${t(auth.username)} ${t(auth.password)}`]); break;
+    case "ntlm": headers.push(["Authorization", `NTLM ${t(auth.username)} ${t(auth.password)}`]); break;
+    case "apikey": {
+      const key = t(auth.key) || "X-API-Key";
+      if (auth.addTo === "queryParams") url.url += `${url.url.includes("?") ? "&" : "?"}${encodeKeepVars(key)}=${encodeKeepVars(t(auth.value))}`;
+      else if (auth.addTo === "cookie") headers.push(["Cookie", `${key}=${t(auth.value)}`]);
+      else headers.push([key, t(auth.value)]);
+      break;
+    }
+    case "iam": case "awsv4": {
+      const parts = ["AWS", t(auth.accessKeyId), t(auth.secretAccessKey)];
+      if (auth.sessionToken) parts.push(`token:${t(auth.sessionToken)}`);
+      if (auth.region) parts.push(`region:${t(auth.region)}`);
+      if (auth.service) parts.push(`service:${t(auth.service)}`);
+      headers.push(["Authorization", parts.join(" ")]);
+      break;
+    }
+    case "oauth2": {
+      if (auth.accessToken) headers.push(["Authorization", `${t(auth.tokenPrefix) || "Bearer"} ${t(auth.accessToken)}`]);
+      else {
+        notes.push("# OAuth 2.0 auth was not converted: set Authorization: Bearer {{token}} or use `Authorization: openid <flow> <prefix>`");
+        warnings?.push(`${where}: OAuth 2.0 auth needs setting up`);
+      }
+      break;
+    }
+    default:
+      notes.push(`# ${str(auth.type)} auth was not converted`);
+      warnings?.push(`${where}: ${str(auth.type)} auth was not converted`);
+  }
+  return notes;
+}
+
+function insomniaBody(body: Json, headers: [string, string][], warnings: string[] | undefined, where: string): string | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const t = (v: unknown) => insomniaTemplate(v, warnings, where);
+  const type = str(body.mimeType);
+  const setType = (value: string) => { if (!hasHeader(headers, "Content-Type")) headers.push(["Content-Type", value]); };
+  if (body.fileName) { if (type) setType(type); return `< ${filePath(str(body.fileName))}`; }
+  if (/x-www-form-urlencoded/i.test(type)) {
+    setType("application/x-www-form-urlencoded");
+    return formBody((Array.isArray(body.params) ? body.params : []).filter((p: Json) => !p?.disabled).map((p: Json) => [t(p.name), t(p.value)] as [string, string]));
+  }
+  if (/multipart\/form-data/i.test(type)) {
+    const others = headers.filter(([k]) => k.toLowerCase() !== "content-type");
+    headers.length = 0;
+    headers.push(...others, ["Content-Type", `multipart/form-data; boundary=${BOUNDARY}`]);
+    return multipartBody((Array.isArray(body.params) ? body.params : []).filter((p: Json) => !p?.disabled).map((p: Json) =>
+      p.type === "file" ? { name: t(p.name), file: str(p.fileName) || "./file" } : { name: t(p.name), value: t(p.value) }));
+  }
+  if (/graphql/i.test(type)) {
+    setType("application/json");
+    headers.push(["X-REQUEST-TYPE", "GraphQL"]);
+    let query = str(body.text);
+    let variables = "";
+    try {
+      const parsed = JSON.parse(query) as Json;
+      query = str(parsed.query);
+      if (parsed.variables && (typeof parsed.variables !== "object" || Object.keys(parsed.variables).length)) variables = typeof parsed.variables === "string" ? parsed.variables : JSON.stringify(parsed.variables, null, 2);
+    } catch { /* plain query text */ }
+    query = t(query).replace(/\s+$/, "");
+    return variables ? `${query}\n\n${t(variables)}` : query;
+  }
+  if (body.text === undefined || str(body.text) === "") return undefined;
+  if (type) setType(type);
+  return t(body.text);
+}
+
+function insomniaRequest(req: Json, inherited: { auth: Json; headers: [string, string][] }, used: Set<string>, warnings?: string[]): string {
+  const title = str(req.name) || "request";
+  const where = title;
+  const lines: string[] = [`### ${title}`, `# @name ${uniqueName(slug(title), used)}`];
+  for (const line of str(req.description).split(/\r?\n/).filter((l) => l.trim())) lines.push(`# ${line}`);
+  const url = { url: insomniaTemplate(req.url, warnings, where) };
+  const query = insomniaPairs(req.parameters, warnings, where);
+  if (query.length) url.url += `${url.url.includes("?") ? "&" : "?"}${query.map(([k, v]) => `${encodeKeepVars(k)}=${encodeKeepVars(v)}`).join("&")}`;
+  const own = insomniaPairs(req.headers, warnings, where);
+  const headers: [string, string][] = [...inherited.headers.filter(([k]) => !hasHeader(own, k)), ...own];
+  const auth = req.authentication && req.authentication.type && req.authentication.type !== "inherit" ? req.authentication : inherited.auth;
+  const notes = hasHeader(headers, "Authorization") ? [] : insomniaAuth(auth, headers, url, warnings, where);
+  const body = insomniaBody(req.body, headers, warnings, where);
+  lines.push(...notes);
+  const pre = str(req.scripts?.preRequest ?? req.preRequestScript);
+  const post = str(req.scripts?.afterResponse ?? req.afterResponseScript);
+  if (pre.trim() || post.trim()) warnings?.push(`${where}: Insomnia script kept; check its insomnia.* API calls`);
+  if (pre.trim()) lines.push("# r3q: imported Insomnia script, check the API calls", scriptBlock("<", pre, "Converted from Insomnia: insomnia.* calls are kept verbatim; port them to request.* / client.*"));
+  lines.push(`${str(req.method || "GET").toUpperCase()} ${url.url}`);
+  for (const [k, v] of headers) lines.push(`${k}: ${v}`);
+  if (body !== undefined) lines.push("", body);
+  if (post.trim()) lines.push("", "# r3q: imported Insomnia script, check the API calls", scriptBlock(">", post, "Converted from Insomnia: insomnia.* calls are kept verbatim; port them to client.* / response.*"));
+  return lines.join("\n");
+}
+
+function parseInsomnia(data: unknown): Json {
+  let doc: Json = data;
+  if (typeof data === "string") { try { doc = JSON.parse(data); } catch { doc = parseYaml(data); } }
+  if (!doc || typeof doc !== "object") throw new Error("not an Insomnia export");
+  return doc;
+}
+
+/** The tree of an Insomnia v4 export (`resources` with parentIds) or v5 YAML (`collection` with `children`). */
+function insomniaTree(doc: Json, warnings?: string[]): { name: string; root: InsomniaNode } {
+  const node = (name: string, folder: boolean, sort = 0): InsomniaNode => ({ name, folder, children: [], headers: [], variables: [], sort });
+  if (Array.isArray(doc.resources)) {
+    const resources: Json[] = doc.resources;
+    const workspace = resources.find((r) => r?._type === "workspace");
+    const root = node(str(workspace?.name) || "insomnia", true);
+    const byId = new Map<string, InsomniaNode>();
+    if (workspace?._id) byId.set(str(workspace._id), root);
+    const items = resources.filter((r) => r?._type === "request_group" || r?._type === "request" || r?._type === "grpc_request" || r?._type === "websocket_request");
+    for (const r of items) {
+      const n = node(str(r.name), r._type === "request_group", typeof r.metaSortKey === "number" ? r.metaSortKey : 0);
+      if (r._type === "request_group") {
+        n.auth = r.authentication;
+        n.headers = insomniaPairs(r.headers, warnings, n.name);
+        n.variables = Object.entries(flatten(r.environment ?? {}));
+      } else if (r._type !== "request") {
+        warnings?.push(`${n.name}: Insomnia ${str(r._type)} was skipped`);
+        continue;
+      } else n.request = r;
+      byId.set(str(r._id), n);
+    }
+    for (const r of items) {
+      const n = byId.get(str(r._id));
+      if (n) (byId.get(str(r.parentId)) ?? root).children.push(n);
+    }
+    const sortTree = (n: InsomniaNode): void => { n.children.sort((a, b) => a.sort - b.sort); n.children.forEach(sortTree); };
+    sortTree(root);
+    return { name: root.name, root };
+  }
+  if (Array.isArray(doc.collection)) {
+    const build = (item: Json): InsomniaNode => {
+      if (Array.isArray(item.children)) {
+        const n = node(str(item.name) || "folder", true);
+        n.auth = item.authentication;
+        n.headers = insomniaPairs(item.headers, warnings, n.name);
+        n.variables = Object.entries(flatten(item.environment ?? {}));
+        n.children = item.children.map(build);
+        if (item.scripts?.preRequest || item.scripts?.afterResponse) warnings?.push(`${n.name}: folder scripts were not converted`);
+        return n;
+      }
+      const n = node(str(item.name) || "request", false);
+      n.request = item;
+      return n;
+    };
+    const root = node(str(doc.name) || "insomnia", true);
+    root.children = doc.collection.map(build);
+    return { name: root.name, root };
+  }
+  throw new Error("not an Insomnia export: no resources or collection");
+}
+
+/**
+ * An Insomnia export (v4 JSON or v5 YAML) as `.http` files, laid out as
+ * importPostman does: top-level requests in `<workspace>.http`, a folder's
+ * requests in `<folder>.http`, subfolders under `<folder>/`. Folder headers
+ * and auth are copied onto each request; folder variables head the file.
+ */
+export function importInsomnia(data: unknown | string, warnings?: string[]): Map<string, string> {
+  const doc = parseInsomnia(data);
+  const { name, root } = insomniaTree(doc, warnings);
+  const files = new Map<string, string>();
+  const write = (path: string, vars: [string, string][], blocks: string[]): void => {
+    if (blocks.length === 0) return;
+    let target = path;
+    for (let n = 2; files.has(target); n++) target = path.replace(/\.http$/, `-${n}.http`);
+    const top = vars.length ? `${vars.map(([k, v]) => `@${k} = ${v}`).join("\n")}\n\n` : "";
+    files.set(target, `${top}${blocks.join("\n\n")}\n`);
+  };
+  const walk = (folder: InsomniaNode, file: string, dir: string, inherited: { auth: Json; headers: [string, string][] }, vars: [string, string][]): void => {
+    const auth = folder.auth && folder.auth.type && folder.auth.type !== "inherit" && folder.auth.type !== "none" ? folder.auth : inherited.auth;
+    const headers = [...inherited.headers.filter(([k]) => !hasHeader(folder.headers, k)), ...folder.headers];
+    const scopeVars = [...vars.filter(([k]) => !folder.variables.some(([j]) => j === k)), ...folder.variables];
+    const used = new Set<string>();
+    write(file, scopeVars, folder.children.filter((c) => !c.folder).map((c) => insomniaRequest(c.request, { auth, headers }, used, warnings)));
+    const usedFolders = new Set<string>();
+    for (const sub of folder.children.filter((c) => c.folder)) {
+      const subName = uniqueName(slug(sub.name || "folder"), usedFolders);
+      walk(sub, `${dir}${subName}.http`, `${dir}${subName}/`, { auth, headers }, scopeVars);
+    }
+  };
+  walk(root, `${slug(name)}.http`, "", { auth: undefined, headers: [] }, []);
+  return files;
+}
+
+/** Insomnia environments as an `http-client.env.json` fragment: the base environment is `$shared`, sub-environments by name. Nested values are flattened to dotted keys. */
+export function importInsomniaEnvironments(data: unknown | string): Record<string, Record<string, string>> {
+  const doc = parseInsomnia(data);
+  const out: Record<string, Record<string, string>> = {};
+  const add = (base: Json, subs: Json[]): void => {
+    const vars = flatten(base?.data ?? {});
+    if (Object.keys(vars).length) out.$shared = { ...out.$shared, ...vars };
+    for (const sub of subs) out[str(sub?.name) || "default"] = flatten(sub?.data ?? {});
+  };
+  if (Array.isArray(doc.resources)) {
+    const envs: Json[] = doc.resources.filter((r: Json) => r?._type === "environment");
+    const ids = new Set(envs.map((e) => str(e._id)));
+    for (const base of envs.filter((e) => !ids.has(str(e.parentId)))) add(base, envs.filter((e) => e.parentId === base._id));
+    return out;
+  }
+  const list: Json[] = Array.isArray(doc.environments) ? doc.environments : doc.environments ? [doc.environments] : [];
+  for (const base of list) add(base, Array.isArray(base?.subEnvironments) ? base.subEnvironments : []);
+  return out;
+}
+
+// ---------------------------------------------------------------- export (OpenAPI 3.0.3, Postman v2.1)
+
+export interface ExportInput { path: string; file: HttpFile }
+
+const STREAM_METHODS = new Set(["WEBSOCKET", "WS", "WSS", "SSE", "EVENTSOURCE", "GRPC", "MQTT", "AMQP"]);
+
+/** Expand a leading `{{baseUrl}}` from eager file variables (repeatedly, for variables built from variables); path variables stay. */
+function expandFileVars(text: string, file: HttpFile): string {
+  const vars = new Map<string, string>();
+  for (const v of file.variables) if (!v.lazy && !vars.has(v.name)) vars.set(v.name, v.value);
+  let out = text.trimStart();
+  for (let pass = 0; pass < 5; pass++) {
+    const m = /^\{\{\s*([\w.-]+)\s*\}\}/.exec(out);
+    const value = m ? vars.get(m[1]!) : undefined;
+    if (value === undefined) break;
+    out = value + out.slice(m![0].length);
+  }
+  return out;
+}
+
+function requestHeaders(req: HttpRequest): [string, string][] {
+  return req.headers.flatMap((h) => "name" in h ? [[h.name, h.value] as [string, string]] : []);
+}
+
+function requestBodyText(req: HttpRequest): string | undefined {
+  if (!req.body.length) return undefined;
+  const text = req.body.map((p) => p.kind === "text" ? p.text : `< ${p.path}`).join("\n");
+  return text.trim() === "" ? undefined : text;
+}
+
+/** JSON with `{{vars}}`: a bare `{{x}}` becomes the string "{{x}}"; inside a string it stays. */
+function jsonWithVars(text: string): unknown {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === "\\" && inString) { out += c + (text[i + 1] ?? ""); i++; continue; }
+    if (c === '"') { inString = !inString; out += c; continue; }
+    if (!inString && text.startsWith("{{", i)) {
+      const end = text.indexOf("}}", i + 2);
+      if (end !== -1) { out += JSON.stringify(text.slice(i, end + 2)); i = end + 1; continue; }
+    }
+    out += c;
+  }
+  return JSON.parse(out);
+}
+
+function splitUrl(url: string): { origin: string; path: string; query: [string, string][] } {
+  const line = url.split("\n").map((l) => l.trim()).join("");
+  const hashless = line.split("#")[0]!;
+  const q = hashless.indexOf("?");
+  const base = q === -1 ? hashless : hashless.slice(0, q);
+  const dec = (s: string) => { try { return decodeURIComponent(s.replace(/\+/g, " ")); } catch { return s; } };
+  const query = q === -1 ? [] : hashless.slice(q + 1).split("&").filter(Boolean).map((pair) => {
+    const eq = pair.indexOf("=");
+    return eq === -1 ? [dec(pair), ""] as [string, string] : [dec(pair.slice(0, eq)), dec(pair.slice(eq + 1))] as [string, string];
+  });
+  const m = /^([a-z][\w+.-]*:\/\/[^/]*|\{\{[^}]+\}\})(.*)$/i.exec(base);
+  if (m) return { origin: m[1]!, path: m[2] || "/", query };
+  if (base.startsWith("/")) return { origin: "", path: base, query };
+  const slash = base.indexOf("/");
+  return slash === -1 ? { origin: base, path: "/", query } : { origin: base.slice(0, slash), path: base.slice(slash), query };
+}
+
+function tagsOf(req: HttpRequest, file: HttpFile): string[] {
+  const values = ["tag", "tags"].flatMap((k) => [...(file.metadata.get(k) ?? []), ...(req.metadata.get(k) ?? [])]);
+  return [...new Set(values.flatMap((v) => v.split(/[\s,]+/)).filter(Boolean))];
+}
+
+const SKIP_HEADERS = new Set(["authorization", "content-type", "content-length", "host", "user-agent"]);
+
+/** Collection requests as an OpenAPI 3.0.3 document. */
+export function exportOpenApi(files: ExportInput[], options: { title?: string; version?: string; root: string }): Record<string, unknown> {
+  const paths: Record<string, Record<string, Json>> = {};
+  const servers: string[] = [];
+  const serverVars: Record<string, { default: string }> = {};
+  const schemes: Record<string, Json> = {};
+  const tags = new Set<string>();
+  const ids = new Set<string>();
+  for (const { file } of files) {
+    for (const req of file.requests) {
+      if (req.error || req.fromCurl || STREAM_METHODS.has(req.method)) continue;
+      const method = (req.method === "GRAPHQL" ? "POST" : req.method).toLowerCase();
+      if (!(HTTP_METHODS as readonly string[]).includes(method)) continue;
+      const { origin, path: rawPath, query } = splitUrl(expandFileVars(req.url, file));
+      if (origin) {
+        let server = origin;
+        const leading = /^\{\{\s*([^}]+?)\s*\}\}$/.exec(origin);
+        if (leading) { server = `{${leading[1]}}`; serverVars[leading[1]!] = { default: "http://localhost" }; }
+        else {
+          if (!/^[a-z][\w+.-]*:\/\//i.test(server)) server = `http://${server}`;
+          server = server.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, n: string) => { serverVars[n] ??= { default: n }; return `{${n}}`; });
+        }
+        if (!servers.includes(server)) servers.push(server);
+      }
+      const parameters: Json[] = [];
+      const fileVar = (n: string) => file.variables.find((v) => v.name === n && !v.lazy)?.value;
+      const path = rawPath.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, n: string) => {
+        const name = n.replace(/[^\w.-]/g, "_");
+        if (!parameters.some((p) => p.in === "path" && p.name === name)) {
+          const example = fileVar(n);
+          parameters.push({ name, in: "path", required: true, schema: { type: "string" }, ...(example !== undefined && !example.includes("{{") ? { example } : {}) });
+        }
+        return `{${name}}`;
+      }) || "/";
+      for (const [name, value] of query) {
+        parameters.push({ name, in: "query", schema: { type: "string" }, ...(value && !value.includes("{{") ? { example: value } : {}) });
+      }
+      const headers = requestHeaders(req);
+      const security: Json[] = [];
+      for (const [name, value] of headers) {
+        const lower = name.toLowerCase();
+        if (lower === "authorization") {
+          const scheme = value.trim().split(/\s+/)[0]!.toLowerCase();
+          if (scheme === "bearer" || scheme === "oauth2" || scheme === "openid") { schemes.bearerAuth = { type: "http", scheme: "bearer" }; security.push({ bearerAuth: [] }); }
+          else if (scheme === "basic") { schemes.basicAuth = { type: "http", scheme: "basic" }; security.push({ basicAuth: [] }); }
+          else if (scheme === "digest") { schemes.digestAuth = { type: "http", scheme: "digest" }; security.push({ digestAuth: [] }); }
+          continue;
+        }
+        if (SKIP_HEADERS.has(lower)) continue;
+        parameters.push({ name, in: "header", schema: { type: "string" }, ...(!value.includes("{{") ? { example: value } : {}) });
+      }
+      const op: Json = {};
+      op.summary = req.title ?? req.name ?? `${method.toUpperCase()} ${path}`;
+      const id = slug(req.name ?? req.title ?? `${method} ${path}`).replace(/-([a-z0-9])/g, (_m, c: string) => c.toUpperCase());
+      op.operationId = uniqueName(id, ids);
+      const opTags = tagsOf(req, file);
+      if (opTags.length) { op.tags = opTags; opTags.forEach((t) => tags.add(t)); }
+      if (parameters.length) op.parameters = parameters;
+      const body = requestBodyText(req);
+      if (body !== undefined) {
+        const declared = headers.find(([k]) => k.toLowerCase() === "content-type")?.[1]?.split(";")[0]?.trim();
+        let json: unknown;
+        let isJson = false;
+        if (req.method === "GRAPHQL") { json = { query: body }; isJson = true; }
+        else if (!declared || /json/i.test(declared)) { try { json = jsonWithVars(body); isJson = true; } catch { /* not JSON */ } }
+        const type = isJson ? (declared && /json/i.test(declared) ? declared : "application/json") : declared ?? "text/plain";
+        op.requestBody = { content: { [type]: { example: isJson ? json : body } } };
+      }
+      if (security.length) op.security = security;
+      op.responses = { default: { description: "Response" } };
+      const item = paths[path] ?? (paths[path] = {});
+      if (!item[method]) item[method] = op;
+    }
+  }
+  const doc: Record<string, unknown> = {
+    openapi: "3.0.3",
+    info: { title: options.title ?? "r3q collection", version: options.version ?? "1.0.0" },
+  };
+  if (servers.length) doc.servers = servers.map((url) => {
+    const names = [...url.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]!);
+    return names.length ? { url, variables: Object.fromEntries(names.map((n) => [n, serverVars[n] ?? { default: n }])) } : { url };
+  });
+  if (tags.size) doc.tags = [...tags].map((name) => ({ name }));
+  doc.paths = paths;
+  if (Object.keys(schemes).length) doc.components = { securitySchemes: schemes };
+  return doc;
+}
+
+function postmanUrlObject(raw: string): Json {
+  const { origin, path, query } = splitUrl(raw);
+  const url: Json = { raw: raw.split("\n").map((l) => l.trim()).join("") };
+  const proto = /^([a-z][\w+.-]*):\/\/(.*)$/i.exec(origin);
+  if (proto) {
+    url.protocol = proto[1];
+    const hostPort = /^(.*?)(?::(\d+))?$/.exec(proto[2]!)!;
+    url.host = hostPort[1]!.split(".");
+    if (hostPort[2]) url.port = hostPort[2];
+  } else if (origin) url.host = [origin];
+  const segments = path.split("/").filter(Boolean);
+  if (segments.length) url.path = segments;
+  if (query.length) url.query = query.map(([key, value]) => ({ key, value }));
+  return url;
+}
+
+/** Collection requests as a Postman v2.1 collection; directories (relative to root) become folders. */
+export function exportPostman(files: ExportInput[], options: { name?: string; root: string }): Record<string, unknown> {
+  const rootItems: Json[] = [];
+  const folders = new Map<string, Json[]>();
+  const folderFor = (dir: string): Json[] => {
+    if (!dir) return rootItems;
+    const existing = folders.get(dir);
+    if (existing) return existing;
+    const slash = dir.lastIndexOf("/");
+    const parent = folderFor(slash === -1 ? "" : dir.slice(0, slash));
+    const item: Json[] = [];
+    parent.push({ name: dir.slice(slash + 1), item });
+    folders.set(dir, item);
+    return item;
+  };
+  const variables: Json[] = [];
+  const root = options.root.replace(/[/\\]+$/, "");
+  const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));
+  for (const { path, file } of sorted) {
+    const rel = (path.startsWith(`${root}/`) || path.startsWith(`${root}\\`) ? path.slice(root.length + 1) : path).replace(/\\/g, "/");
+    const dir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
+    const target = folderFor(dir);
+    for (const v of file.variables) if (!v.lazy && !variables.some((x) => x.key === v.name)) variables.push({ key: v.name, value: v.value });
+    for (const req of file.requests) {
+      if (req.error || req.fromCurl || STREAM_METHODS.has(req.method)) continue;
+      const headers = requestHeaders(req);
+      const request: Json = { method: req.method === "GRAPHQL" ? "POST" : req.method };
+      const header: Json[] = [];
+      for (const [key, value] of headers) {
+        if (key.toLowerCase() === "authorization") {
+          const m = /^\s*(\S+)\s*(.*)$/s.exec(value);
+          const scheme = m?.[1]?.toLowerCase();
+          const rest = m?.[2]?.trim() ?? "";
+          if (scheme === "bearer") { request.auth = { type: "bearer", bearer: [{ key: "token", value: rest, type: "string" }] }; continue; }
+          if (scheme === "basic") {
+            const space = rest.search(/\s/);
+            const colon = rest.indexOf(":");
+            let user: string, pass: string;
+            if (colon > 0 && (space === -1 || colon < space)) { user = rest.slice(0, colon); pass = rest.slice(colon + 1); }
+            else if (space > 0) { user = rest.slice(0, space); pass = rest.slice(space).trim(); }
+            else { header.push({ key, value }); continue; }
+            request.auth = { type: "basic", basic: [{ key: "username", value: user, type: "string" }, { key: "password", value: pass, type: "string" }] };
+            continue;
+          }
+        }
+        header.push({ key, value });
+      }
+      request.header = header;
+      request.url = postmanUrlObject(req.url);
+      const body = requestBodyText(req);
+      if (body !== undefined) {
+        const type = headers.find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "";
+        if (req.method === "GRAPHQL") request.body = { mode: "graphql", graphql: { query: body, variables: "" } };
+        else if (/x-www-form-urlencoded/i.test(type)) {
+          const joined = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).join("");
+          request.body = { mode: "urlencoded", urlencoded: splitUrl(`/?${joined}`).query.map(([key, value]) => ({ key, value, type: "text" })) };
+        } else {
+          let json = /json/i.test(type);
+          if (!json && !type) { try { jsonWithVars(body); json = true; } catch { /* text */ } }
+          request.body = { mode: "raw", raw: body, ...(json ? { options: { raw: { language: "json" } } } : /xml/i.test(type) ? { options: { raw: { language: "xml" } } } : {}) };
+        }
+      }
+      target.push({ name: req.title ?? req.name ?? `${request.method} ${request.url.raw}`, request });
+    }
+  }
+  const out: Record<string, unknown> = {
+    info: { name: options.name ?? "r3q collection", schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+    item: rootItems,
+  };
+  if (variables.length) out.variable = variables;
+  return out;
 }
 
 // ---------------------------------------------------------------- Bruno

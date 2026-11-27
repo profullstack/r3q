@@ -15,6 +15,8 @@ import { resolve } from "node:path";
 import vm from "node:vm";
 import { jsonPath, jsonPathFirst, parseXml, stringify, textContent, xpath, xpathText } from "./query.ts";
 import type { Assertion, HttpResponse, PreparedRequest, Script } from "./types.ts";
+import { deepEqual, validateSchema } from "./schema.ts";
+import { makeHelpers } from "./helpers.ts";
 
 export interface TestResult { name: string; passed: boolean; message?: string }
 
@@ -41,11 +43,134 @@ export interface ScriptRun {
   cookies?: (name: string) => { name: string; value: string }[];
   substitute?: (text: string) => Promise<string>;
   log(line: string): void;
+  /** `r3q.send("file.http#name", vars)`: run another saved request from a script. */
+  runRequest?: (spec: string, vars?: Record<string, string>) => Promise<{ status: number; headers: Record<string, string>; body: unknown; text: string }>;
 }
 
 export interface ScriptOutcome { tests: TestResult[]; exited: boolean }
 
 class Exit extends Error {}
+
+const isExit = (error: unknown): boolean => error instanceof Exit || (error as Error)?.constructor?.name === "Exit";
+
+/**
+ * Record a test. The result keeps its place in the list even when `fn` is
+ * async: the entry is pushed now and settled when the promise does, and
+ * runScript awaits `pending` before it returns.
+ */
+function recordTest(tests: TestResult[], pending: Promise<void>[], name: string, fn: () => unknown, rethrowExit = false): void {
+  const entry: TestResult = { name, passed: true };
+  tests.push(entry);
+  const failed = (error: unknown): void => { entry.passed = false; entry.message = (error as Error)?.message ?? String(error); };
+  try {
+    const out = fn() as { then?: unknown } | undefined;
+    if (out && typeof out.then === "function") {
+      pending.push(Promise.resolve(out).then(() => undefined, (error: unknown) => {
+        if (isExit(error)) { tests.splice(tests.indexOf(entry), 1); return; }
+        failed(error);
+      }));
+    }
+  } catch (error) {
+    if (isExit(error)) { tests.splice(tests.indexOf(entry), 1); if (rethrowExit) throw error; return; }
+    failed(error);
+  }
+}
+
+const show = (value: unknown): string => {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (value === undefined) return "undefined";
+  if (typeof value === "function") return "[function]";
+  try { const text = JSON.stringify(value); return text.length > 200 ? `${text.slice(0, 197)}...` : text; } catch { return String(value); }
+};
+const kindOf = (value: unknown): string => value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+const isRegExp = (value: unknown): value is RegExp => Object.prototype.toString.call(value) === "[object RegExp]";
+
+/** A chai/jest-flavoured `expect`. Chains (`to`, `be`, `have`...) are readable no-ops; `not` negates. */
+export function expect(actual: unknown, negate = false): Record<string, unknown> {
+  const check = (pass: boolean, what: string): void => {
+    if (pass === negate) throw new Error(`expected ${show(actual)} ${negate ? "not " : ""}${what}`);
+  };
+  const api: Record<string, unknown> = {};
+  const self = (): Record<string, unknown> => api;
+  const method = (name: string | string[], fn: (...args: never[]) => void): void => {
+    for (const n of Array.isArray(name) ? name : [name]) api[n] = (...args: never[]) => { fn(...args); return api; };
+  };
+  const getter = (name: string | string[], get: () => unknown): void => {
+    for (const n of Array.isArray(name) ? name : [name]) Object.defineProperty(api, n, { get, enumerable: false });
+  };
+  getter(["to", "be", "been", "is", "that", "which", "and", "has", "have", "with", "at", "of", "does", "deep", "own"], self);
+  getter("not", () => expect(actual, !negate));
+  method(["equal", "equals", "toBe"], (expected: unknown) => check(Object.is(actual, expected) || actual === expected, `to equal ${show(expected)}`));
+  method(["eql", "toEqual", "toStrictEqual"], (expected: unknown) => check(deepEqual(actual, expected), `to deeply equal ${show(expected)}`));
+  method(["a", "an"], (type: string) => check(kindOf(actual) === String(type).toLowerCase(), `to be ${/^[aeiou]/i.test(type) ? "an" : "a"} ${type} (it is ${kindOf(actual)})`));
+  method(["include", "includes", "contain", "contains", "toContain"], (item: unknown) => {
+    let pass = false;
+    if (typeof actual === "string") pass = actual.includes(String(item));
+    else if (Array.isArray(actual)) pass = actual.some((v) => deepEqual(v, item));
+    else if (actual && typeof actual === "object" && item && typeof item === "object") pass = Object.entries(item).every(([k, v]) => deepEqual((actual as Record<string, unknown>)[k], v));
+    check(pass, `to include ${show(item)}`);
+  });
+  method(["property", "toHaveProperty"], (...args: never[]) => {
+    const [name, value] = args as unknown as [string, unknown];
+    const has = actual !== null && actual !== undefined && typeof actual === "object" && name in (actual as object);
+    if (args.length < 2) check(has, `to have property ${show(name)}`);
+    else check(has && deepEqual((actual as Record<string, unknown>)[name], value), `to have property ${show(name)} equal to ${show(value)}`);
+  });
+  method(["length", "lengthOf", "toHaveLength"], (n: number) => {
+    const len = (actual as { length?: unknown } | null)?.length;
+    check(len === n, `to have length ${n} (it has ${show(len)})`);
+  });
+  method(["match", "toMatch"], (pattern: RegExp | string) => {
+    const re = isRegExp(pattern) ? new RegExp(pattern.source, pattern.flags) : new RegExp(String(pattern));
+    check(re.test(String(actual)), `to match ${String(pattern)}`);
+  });
+  method(["above", "gt", "greaterThan", "toBeGreaterThan"], (n: number) => check(Number(actual) > n, `to be above ${n}`));
+  method(["least", "gte", "toBeGreaterThanOrEqual"], (n: number) => check(Number(actual) >= n, `to be at least ${n}`));
+  method(["below", "lt", "lessThan", "toBeLessThan"], (n: number) => check(Number(actual) < n, `to be below ${n}`));
+  method(["most", "lte", "toBeLessThanOrEqual"], (n: number) => check(Number(actual) <= n, `to be at most ${n}`));
+  method("oneOf", (list: unknown[]) => check(list.some((v) => deepEqual(v, actual)), `to be one of ${show(list)}`));
+  method(["status", "toHaveStatus"], (code: number) => {
+    const r = actual as { status?: unknown; statusCode?: unknown } | null;
+    const got = r?.status ?? r?.statusCode;
+    check(got === code, `to have status ${code} (it has ${show(got)})`);
+  });
+  method(["matchSchema", "toMatchSchema", "jsonSchema"], (schema: object) => {
+    const result = validateSchema(actual, schema);
+    if (result.valid === negate) {
+      const detail = result.errors.slice(0, 3).map((e) => `${e.path}: ${e.message}`).join("; ");
+      throw new Error(negate ? "expected value not to match the schema" : `schema validation failed: ${detail}${result.errors.length > 3 ? ` (+${result.errors.length - 3} more)` : ""}`);
+    }
+  });
+  method("toBeTruthy", () => check(Boolean(actual), "to be truthy"));
+  method("toBeFalsy", () => check(!actual, "to be falsy"));
+  method("toBeNull", () => check(actual === null, "to be null"));
+  method("toBeUndefined", () => check(actual === undefined, "to be undefined"));
+  method("toBeDefined", () => check(actual !== undefined, "to be defined"));
+  getter("true", () => { check(actual === true, "to be true"); return api; });
+  getter("false", () => { check(actual === false, "to be false"); return api; });
+  getter("null", () => { check(actual === null, "to be null"); return api; });
+  getter("undefined", () => { check(actual === undefined, "to be undefined"); return api; });
+  getter("ok", () => { check(Boolean(actual), "to be ok (truthy)"); return api; });
+  getter("exist", () => { check(actual !== null && actual !== undefined, "to exist"); return api; });
+  getter("empty", () => {
+    const empty = typeof actual === "string" || Array.isArray(actual) ? actual.length === 0 : actual && typeof actual === "object" ? Object.keys(actual).length === 0 : false;
+    check(Boolean(empty), "to be empty");
+    return api;
+  });
+  return api;
+}
+
+/** Globals shared by both dialects: expect, validateSchema and the r3q helper object. */
+function commonGlobals(run: ScriptRun): Record<string, unknown> {
+  const r3q = {
+    ...makeHelpers(),
+    async send(spec: string, vars?: Record<string, string>) {
+      if (!run.runRequest) throw new Error("r3q.send is not available here");
+      return run.runRequest(spec, vars);
+    },
+  };
+  return { expect: (actual: unknown) => expect(actual), validateSchema, r3q };
+}
 
 const ALGORITHMS = { md5: "md5", sha1: "sha1", sha256: "sha256", sha384: "sha384", sha512: "sha512" } as const;
 
@@ -103,13 +228,10 @@ export function scriptBody(response: HttpResponse, messages?: string[]): unknown
   return response.text;
 }
 
-function jetbrainsGlobals(run: ScriptRun, tests: TestResult[]): Record<string, unknown> {
+function jetbrainsGlobals(run: ScriptRun, tests: TestResult[], pending: Promise<void>[]): Record<string, unknown> {
   const { session } = run;
   const client = {
-    test(name: string, fn: () => void) {
-      try { fn(); tests.push({ name, passed: true }); }
-      catch (error) { if (error instanceof Exit) throw error; tests.push({ name, passed: false, message: (error as Error).message }); }
-    },
+    test(name: string, fn: () => unknown) { recordTest(tests, pending, name, fn, true); },
     assert(condition: unknown, message?: string) { if (!condition) throw new Error(message ?? "assertion failed"); },
     log(...text: unknown[]) { run.log(text.map(stringify).join(" ")); },
     exit() { throw new Exit(); },
@@ -153,6 +275,8 @@ function jetbrainsGlobals(run: ScriptRun, tests: TestResult[]): Record<string, u
     templateValue: (i: number) => run.scope[`$template${i}`],
   };
   const out: Record<string, unknown> = {
+    ...commonGlobals(run),
+    test: (name: string, fn: () => unknown) => client.test(name, fn),
     client, request, crypto: cryptoApi(), console: { log: client.log, error: client.log, warn: client.log, info: client.log },
     jsonPath: (obj: unknown, path: string) => jsonPathFirst(typeof obj === "string" ? JSON.parse(obj) : obj, path),
     xpath: (doc: unknown, expr: string) => { const found = xpath(typeof doc === "string" ? parseXml(doc) : doc as ReturnType<typeof parseXml>, expr); return found.length ? textContent(found[0]!) : null; },
@@ -178,16 +302,13 @@ function jetbrainsGlobals(run: ScriptRun, tests: TestResult[]): Record<string, u
   return out;
 }
 
-function httpyacGlobals(run: ScriptRun, tests: TestResult[], exports: Record<string, unknown>): Record<string, unknown> {
+function httpyacGlobals(run: ScriptRun, tests: TestResult[], exports: Record<string, unknown>, pending: Promise<void>[]): Record<string, unknown> {
   const res = run.response;
-  const record = (name: string, fn: () => void): void => {
-    try { fn(); tests.push({ name, passed: true }); }
-    catch (error) { tests.push({ name, passed: false, message: (error as Error).message }); }
-  };
+  const record = (name: string, fn: () => unknown): void => recordTest(tests, pending, name, fn);
   const expect = (cond: boolean, message: string): void => { if (!cond) throw new Error(message); };
   const header = (name: string): string | undefined => res ? headerValues(res.headers, name)[0] : undefined;
   const test = Object.assign(
-    (name: string, fn: () => void | Promise<void>) => record(name, fn as () => void),
+    (name: string, fn: () => unknown) => record(name, fn),
     {
       status: (code: number) => record(`status == ${code}`, () => expect(res?.status === code, `status ${res?.status} is not ${code}`)),
       totalTime: (ms: number) => record(`duration < ${ms}`, () => expect((res?.duration ?? Infinity) < ms, `took ${Math.round(res?.duration ?? 0)}ms, limit ${ms}ms`)),
@@ -212,6 +333,7 @@ function httpyacGlobals(run: ScriptRun, tests: TestResult[], exports: Record<str
   } : { method: run.raw.method, url: run.raw.url, headers: Object.fromEntries(run.raw.headers), body: run.raw.body };
   return {
     ...run.scope,
+    ...commonGlobals(run),
     exports, module: { exports }, require: createRequire(`${run.baseDir}/`),
     test, sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
     response, request, console: { log: (...a: unknown[]) => run.log(a.map(stringify).join(" ")), error: (...a: unknown[]) => run.log(a.map(stringify).join(" ")), info: (...a: unknown[]) => run.log(a.map(stringify).join(" ")), warn: (...a: unknown[]) => run.log(a.map(stringify).join(" ")) },
@@ -230,15 +352,20 @@ export async function runScript(script: Script, run: ScriptRun): Promise<ScriptO
     filename = path;
   }
   const exports: Record<string, unknown> = {};
-  const globals = script.dialect === "jetbrains" ? jetbrainsGlobals(run, tests) : httpyacGlobals(run, tests, exports);
+  const pending: Promise<void>[] = [];
+  const globals = script.dialect === "jetbrains" ? jetbrainsGlobals(run, tests, pending) : httpyacGlobals(run, tests, exports, pending);
   const context = vm.createContext(globals);
+  let exited = false;
   try {
     const wrapped = `(async () => {\n${code}\n})()`;
     await vm.runInContext(wrapped, context, { filename, timeout: 60_000 });
   } catch (error) {
-    if (error instanceof Exit || (error as Error)?.constructor?.name === "Exit") return { tests, exited: true };
-    tests.push({ name: `script error (line ${script.line})`, passed: false, message: (error as Error)?.message ?? String(error) });
+    if (isExit(error)) exited = true;
+    else tests.push({ name: `script error (line ${script.line})`, passed: false, message: (error as Error)?.message ?? String(error) });
   }
+  // Async tests started by the script settle before the outcome is reported.
+  while (pending.length) await Promise.all(pending.splice(0));
+  if (exited) return { tests, exited: true };
   if (script.dialect === "httpyac") {
     for (const [k, v] of Object.entries(exports)) run.variables.set(k, v);
     // Top-level `exports = {...}` replacement is visible on the context.

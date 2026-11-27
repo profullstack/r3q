@@ -129,6 +129,8 @@ export interface HttpResponse {
   /** Final URL after redirects. */
   url: string;
   redirects: string[];
+  /** Every hop of the exchange, redirects included: the network trace. */
+  hops?: { method: string; url: string; status: number; statusText: string; ms: number }[];
 }
 
 /** How the runner asks the person something: the TUI and the CLI each provide one. */

@@ -21,6 +21,12 @@ import { Session, type RunResult } from "./http/runner.ts";
 import type { TestResult } from "./http/scripts.ts";
 import { PromptDialog } from "./prompt-dialog.ts";
 import { createOrg, createProject, loadBundle, readBundle, saveBundle, writeBundle } from "./workspace.ts";
+import { VERSION } from "./http/runner.ts";
+import { jsonPath } from "./http/query.ts";
+import { CookieJar } from "./http/cookies.ts";
+import { Redactor, appendHistory, readHistory, toEntry } from "./history.ts";
+import { collect, passed, runSuite } from "./suite.ts";
+import { ACTIONS, THEME_NAMES, fuzzyFilter, keyBindings, readConfig, writeConfig } from "./tui-config.ts";
 
 export interface State {
   requests: RequestFile[];
@@ -94,7 +100,9 @@ export const USAGE = `Usage:
 
   n new request  v view file  e edit  d duplicate  x delete  r reload
   s save response  c copy as curl  E environment  p new org/project
-  S save workspace bundle  L load bundle  Esc cancel a running request
+  S save workspace bundle  L load bundle  Esc cancel a running request or run
+  / find a request  f JSONPath filter  H timeline  C cookie jar  R run requests
+  t next theme  : command palette  (extra bindings: ~/.config/r3q/config.json "keys")
   Enter sends the selected request, or starts the wizard in an empty collection
   Saved requests are .http files. Deleted files move to .r3q-trash.
 
@@ -124,6 +132,10 @@ export async function main(): Promise<void> {
     console.log(USAGE);
     return;
   }
+  if (argv[0] === "-V" || argv[0] === "--version") {
+    console.log(VERSION);
+    return;
+  }
   if ((COMMANDS as readonly string[]).includes(argv[0] ?? "")) {
     process.exitCode = await cli(argv);
     return;
@@ -132,11 +144,16 @@ export async function main(): Promise<void> {
   const state = createState(root, { requests: [], dirs: 0, truncated: false });
 
   // The form owns cursor movement and Tab order, including multiline fields.
-  const app = await createApp({ theme: themes.dark, title: "r3q", quitKeys: ["ctrl+c"], focusNavigation: false });
+  const config = readConfig();
+  let themeName = THEME_NAMES.includes(config.theme as typeof THEME_NAMES[number]) ? config.theme! : "dark";
+  const bindings = keyBindings(config);
+  const app = await createApp({ theme: themes[themeName as keyof typeof themes] ?? themes.dark, title: "r3q", quitKeys: ["ctrl+c"], focusNavigation: false });
 
   const dialog = new PromptDialog(() => app.invalidate(), (line) => { (state.logs ??= []).push(line); app.invalidate(); });
+  const sentResults: RunResult[] = [];
   const session = new Session({
     root, interaction: dialog, cookieFile: join(root, ".r3q", "cookies.json"),
+    onResult: (r) => { sentResults.push(r); },
     onEvent: (event) => {
       if (event.kind === "message") (state.messages ??= []).push(event.text);
       else (state.logs ??= []).push(event.text);
@@ -218,6 +235,7 @@ export async function main(): Promise<void> {
         result = await session.run(file, target);
       }
       lastResult = result;
+      filter = undefined;
       state.exchange = toExchange(result);
       state.tests = result.tests;
       if (result.prepared) state.sent = { method: result.prepared.method, url: result.prepared.url, headers: result.prepared.headers, body: result.prepared.bodyText };
@@ -227,6 +245,152 @@ export async function main(): Promise<void> {
       state.exchange = { status: 0, statusText: "", headers: [], body: "", ms: 0, bytes: 0, contentType: "", error: error instanceof Error ? error.message : String(error) };
     }
     state.sending = false;
+    app.invalidate();
+    void recordHistory("tui");
+  };
+
+  const recordHistory = async (source: "tui" | "runner"): Promise<void> => {
+    if (!sentResults.length) return;
+    const batch = sentResults.splice(0);
+    const values = [...Object.values(session.secrets())];
+    try {
+      const env = await session.environment(root);
+      for (const [k, v] of Object.entries(env.variables)) if (/pass|secret|token|key|auth|cookie|session|credential/i.test(k) && typeof v === "string") values.push(v);
+      values.push(...Object.values(env.dotenv));
+    } catch { /* no environment */ }
+    const redactor = new Redactor(values);
+    await appendHistory(root, batch.flatMap((r) => r.iterations ?? [r]).map((r) => toEntry(root, r, redactor, source)).filter((e) => e !== undefined)).catch(() => {});
+  };
+
+  let filter: string | undefined;
+  const applyFilter = async (): Promise<void> => {
+    const res = lastResult?.response;
+    if (!lastResult || !res || !state.exchange) { state.note = "Send a request first; f filters its JSON response."; app.invalidate(); return; }
+    const path = await ask("JSONPath filter (empty clears)", filter ?? "$.");
+    filter = path && path !== "$" && path !== "$." ? path : undefined;
+    const base = toExchange(lastResult);
+    if (filter) {
+      try {
+        const found = jsonPath(JSON.parse(res.text), filter);
+        base.body = JSON.stringify(found.length === 1 ? found[0] : found, null, 2);
+        base.contentType = "application/json";
+        state.note = `filter ${filter}: ${found.length} match${found.length === 1 ? "" : "es"} (f to change, empty to clear)`;
+      } catch (error) { state.note = `filter: ${(error as Error).message}`; }
+    } else state.note = "filter cleared";
+    state.exchange = base;
+    state.bodyOffset = 0;
+    app.invalidate();
+  };
+
+  const findRequest = async (): Promise<void> => {
+    if (!state.requests.length) return;
+    const query = await ask("Find request (fuzzy: method, path, name)", "");
+    if (!query) return;
+    const label = (r: RequestFile): string => `${r.method} ${r.file ?? r.id}${r.label ? ` ${r.label}` : ""} ${r.url}`;
+    const matches = fuzzyFilter(query, state.requests, label);
+    if (!matches.length) { state.note = `nothing matches "${query}"`; app.invalidate(); return; }
+    let target = matches[0]!;
+    if (matches.length > 1) {
+      const options = matches.slice(0, 30).map((r, i) => `${i + 1}. ${label(r)}`);
+      const pick = await dialog.pick(`${matches.length} matches for "${query}"`, options);
+      if (pick === undefined) return;
+      target = matches[Number(pick.split(".")[0]) - 1] ?? target;
+    }
+    state.selected = state.requests.indexOf(target);
+    state.pane = "collection";
+    app.invalidate();
+  };
+
+  const timeline = async (): Promise<void> => {
+    const entries = await readHistory(root, 40);
+    if (!entries.length) { state.note = "No sends yet; the timeline fills as you send requests."; app.invalidate(); return; }
+    const options = entries.map((e, i) => `${i + 1}. ${e.at.slice(5, 19).replace("T", " ")}  ${e.status || "ERR"} ${e.method} ${e.url}  ${e.durationMs}ms`);
+    const pick = await dialog.pick("Timeline (secrets redacted)", options);
+    if (pick === undefined) return;
+    const e = entries[Number(pick.split(".")[0]) - 1];
+    if (!e) return;
+    lastResult = undefined;
+    filter = undefined;
+    state.exchange = { status: e.status, statusText: e.statusText, headers: e.responseHeaders, body: e.responseBody ?? "", ms: e.durationMs, bytes: (e.responseBody ?? "").length, contentType: e.responseHeaders.find(([k]) => k.toLowerCase() === "content-type")?.[1] ?? "", error: e.error };
+    state.sent = { method: e.method, url: e.url, headers: e.requestHeaders, body: e.requestBody };
+    state.tests = e.tests ?? [];
+    state.logs = [`from the timeline: ${e.at} (${e.source}), ${e.file}${e.name ? `#${e.name}` : ""}`, ...(e.redirects ?? []).map((u) => `redirect → ${u}`)];
+    state.messages = [];
+    state.bodyOffset = 0;
+    state.note = "reopened from the timeline";
+    app.invalidate();
+  };
+
+  const cookieJar = async (): Promise<void> => {
+    const jar = new CookieJar(join(root, ".r3q", "cookies.json"));
+    if (!jar.cookies.length) { state.note = "The cookie jar is empty."; app.invalidate(); return; }
+    const options = ["Clear all cookies", ...jar.cookies.map((c, i) => `${i + 1}. ${c.domain}${c.path}  ${c.name}=${c.value.length > 30 ? `${c.value.slice(0, 30)}…` : c.value}${c.expires ? `  until ${new Date(c.expires).toISOString().slice(0, 16)}` : "  session"}`)];
+    const pick = await dialog.pick(`Cookie jar: ${jar.cookies.length} cookie(s). Pick one to delete, or clear all`, options);
+    if (pick === undefined) return;
+    if (pick === options[0]) {
+      if (!await dialog.confirm("Remove every cookie in this collection's jar?")) return;
+      jar.clear();
+      session.cookies.clear();
+      state.note = "cookie jar cleared";
+    } else {
+      const c = jar.cookies[Number(pick.split(".")[0]) - 1];
+      if (!c) return;
+      const value = await dialog.prompt(`Edit ${c.name} for ${c.domain} (empty deletes it)`, { default: c.value });
+      if (value === undefined) return;
+      if (value === "") { jar.remove(c.domain, c.name); state.note = `deleted cookie ${c.name}`; }
+      else { jar.set({ ...c, value, domain: c.hostOnly ? c.domain : `.${c.domain}` }); state.note = `updated cookie ${c.name}`; }
+      session.cookies.cookies = new CookieJar(join(root, ".r3q", "cookies.json")).cookies;
+    }
+    app.invalidate();
+  };
+
+  let running: AbortController | undefined;
+  const runRequests = async (): Promise<void> => {
+    if (state.sending) return;
+    const here = current();
+    const fileTarget = here?.file ?? here?.id;
+    const folder = fileTarget?.includes("/") ? fileTarget.slice(0, fileTarget.lastIndexOf("/")) : ".";
+    const options = [`This file (${fileTarget ?? "-"})`, `This folder (${folder})`, "Whole collection", "By tag..."];
+    const pick = await dialog.pick("Run which requests?", options);
+    if (pick === undefined) return;
+    let targets: string[] = [];
+    let tags: string[] | undefined;
+    if (pick === options[0] && fileTarget) targets = [fileTarget];
+    else if (pick === options[1]) targets = [folder];
+    else if (pick === options[3]) { const t = await ask("Tags (comma separated)", "smoke"); if (!t) return; tags = t.split(",").map((x) => x.trim()).filter(Boolean); }
+    const items = await collect(session, root, { targets, tags });
+    if (!items.length) { state.note = "no requests matched"; app.invalidate(); return; }
+    running = new AbortController();
+    state.sending = true;
+    state.exchange = undefined;
+    state.sent = undefined;
+    state.tests = [];
+    state.messages = [];
+    state.logs = [`running ${items.length} request(s); Esc stops after the current one`];
+    app.invalidate();
+    const report = await runSuite(session, items, {
+      signal: running.signal,
+      onResult: (e) => {
+        const r = e.result.response;
+        state.logs!.push(`${e.passed ? "✓" : "✗"} ${e.item.id}#${e.item.label}  ${r ? `${r.status} ${Math.round(r.duration)}ms` : e.result.skipped ?? e.result.error ?? ""}`);
+        for (const t of e.result.tests) state.tests!.push({ ...t, name: `${e.item.label}: ${t.name}` });
+        if (!e.result.tests.length && !e.result.skipped) state.tests!.push({ name: `${e.item.label}: HTTP ${r?.status ?? 0}`, passed: passed(e.result), message: e.result.error });
+        if (e.result.response) { lastResult = e.result; state.exchange = toExchange(e.result); }
+        app.invalidate();
+      },
+    });
+    running = undefined;
+    state.sending = false;
+    state.note = `run: ${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped in ${(report.durationMs / 1000).toFixed(1)}s${report.stopped ? ` (${report.stopped})` : ""}`;
+    app.invalidate();
+    void recordHistory("runner");
+  };
+
+  const nextTheme = (): void => {
+    themeName = THEME_NAMES[(THEME_NAMES.indexOf(themeName as typeof THEME_NAMES[number]) + 1) % THEME_NAMES.length]!;
+    app.setTheme(themes[themeName as keyof typeof themes] ?? themes.dark);
+    writeConfig({ theme: themeName });
+    state.note = `theme: ${themeName} (saved)`;
     app.invalidate();
   };
 
@@ -298,11 +462,56 @@ export async function main(): Promise<void> {
     app.invalidate();
   };
 
+  const perform = (action: string): void => {
+    switch (action) {
+      case "send": if (state.requests.length === 0) manager.create(); else void fire(); return;
+      case "find": findRequest().catch(fail); return;
+      case "run": runRequests().catch(fail); return;
+      case "filter": applyFilter().catch(fail); return;
+      case "timeline": timeline().catch(fail); return;
+      case "cookies": cookieJar().catch(fail); return;
+      case "environment": chooseEnvironment().catch(fail); return;
+      case "theme": nextTheme(); return;
+      case "new": manager.create(current()?.org && current()?.project ? `${current()!.org}/${current()!.project}` : ""); return;
+      case "view": void manager.open("view"); return;
+      case "edit": void manager.open("edit"); return;
+      case "duplicate": void manager.open("duplicate"); return;
+      case "delete": void manager.open("delete"); return;
+      case "reload": void reload(); return;
+      case "save-response": saveResponse().catch(fail); return;
+      case "copy-curl": copyCurl(); return;
+      case "save-bundle": saveWorkspace().catch(fail); return;
+      case "load-bundle": loadWorkspace().catch(fail); return;
+      case "project": newProject().catch(fail); return;
+      case "quit": app.quit(); return;
+    }
+  };
+  const palette = async (): Promise<void> => {
+    const names = Object.keys(ACTIONS);
+    const query = await ask("Command (fuzzy; empty lists all)", "");
+    if (query && query.trim().toLowerCase() in ACTIONS) { perform(query.trim().toLowerCase()); return; }
+    // Names first, then descriptions, so "find" does not lose to an action whose description mentions it.
+    const byName = query ? fuzzyFilter(query, names, (n) => n) : names;
+    const list = query ? [...byName, ...fuzzyFilter(query, names, (n) => ACTIONS[n]!).filter((n) => !byName.includes(n))] : names;
+    if (!list.length) { state.note = `no command matches "${query}"`; app.invalidate(); return; }
+    const pick = list.length === 1 ? list[0] : await dialog.pick("Command palette", list.map((n) => `${n}: ${ACTIONS[n]}`));
+    if (pick) perform(pick.split(":")[0]!);
+  };
+
   app.on("key", (event: KeyEvent) => {
     if (dialog.open) { dialog.key(event); return; }
     if (manager.dialog) { manager.key(event); return; }
+    const bound = bindings.get(event.key.toLowerCase());
+    if (bound) { perform(bound); return; }
     switch (event.key) {
-      case "escape": if (state.sending) { session.abort(); state.note = "cancelled"; } return;
+      case "escape": if (running) { running.abort(); session.abort(); state.note = "stopping the run; finished results are kept"; } else if (state.sending) { session.abort(); state.note = "cancelled"; } return;
+      case "/": perform("find"); return;
+      case ":": palette().catch(fail); return;
+      case "f": perform("filter"); return;
+      case "H": case "shift+h": perform("timeline"); return;
+      case "C": case "shift+c": perform("cookies"); return;
+      case "R": case "shift+r": perform("run"); return;
+      case "t": perform("theme"); return;
       case "s": saveResponse().catch(fail); return;
       case "S": case "shift+s": saveWorkspace().catch(fail); return;
       case "L": case "shift+l": loadWorkspace().catch(fail); return;
