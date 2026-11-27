@@ -30,7 +30,8 @@ test("OAuth1 HMAC-SHA1 matches the widely published Twitter signing example", ()
   const header = oauth1Header(req, `${vector.join(" ")} nonce:kYjzVBB8Y0ZFabxSWbWovY3uYSQ2pTgmZeNu2VS4cg timestamp:1318622958`);
   assert.match(header, /^OAuth /);
   assert.match(header, /oauth_signature="hCtSmYh%2BiHYCEqBWrE7C7hYmtUk%3D"/);
-  assert.ok(header.includes(`oauth_token="${vector[2]}"`));
+  const params = Object.fromEntries([...header.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], decodeURIComponent(m[2]!)]));
+  assert.equal(params.oauth_token, vector[2]);
 });
 
 test("OAuth1 HMAC-SHA1 matches OAuth Core 1.0 Appendix A.5.2 (photos.example.net)", () => {
